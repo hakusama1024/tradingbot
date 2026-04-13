@@ -73,8 +73,10 @@ def build_config(overrides: dict = None) -> dict:
         # Schedule (Eastern Time)
         "market_open_snapshot_time": "09:25",
         "swing_analysis_time": "15:30",
-        "intraday_interval_minutes": 60,
+        "intraday_interval_minutes": int(os.getenv("INTRADAY_INTERVAL_MINUTES", "10")),
         "reflection_time": "16:30",
+        "daily_summary_time": os.getenv("DAILY_SUMMARY_TIME", "16:40"),
+        "weekly_summary_time": os.getenv("WEEKLY_SUMMARY_TIME", "16:45"),
 
         # Minervini swing-trading gate
         "minervini_enabled": True,
@@ -168,6 +170,7 @@ def build_config(overrides: dict = None) -> dict:
         "ntfy_click_url": os.getenv("NTFY_CLICK_URL", ""),
         "ntfy_morning_scan_enabled": _env_flag("NTFY_MORNING_SCAN_ENABLED", True),
         "ntfy_daily_summary_enabled": _env_flag("NTFY_DAILY_SUMMARY_ENABLED", True),
+        "ntfy_weekly_summary_enabled": _env_flag("NTFY_WEEKLY_SUMMARY_ENABLED", True),
         "ntfy_morning_scan_top_n": int(os.getenv("NTFY_MORNING_SCAN_TOP_N", "5")),
         "ntfy_miss_review_enabled": _env_flag("NTFY_MISS_REVIEW_ENABLED", True),
         "ntfy_miss_review_top_n": int(os.getenv("NTFY_MISS_REVIEW_TOP_N", "5")),
@@ -209,7 +212,7 @@ def build_config(overrides: dict = None) -> dict:
         "max_daily_loss": 0.03,
         "max_drawdown": 0.10,
         "min_cash_reserve": 0.20,
-        "max_open_positions": 6,
+        "max_open_positions": int(os.getenv("MAX_OPEN_POSITIONS", "6")),
         "default_stop_loss_pct": 0.08,
         "default_take_profit_pct": 0.15,
 

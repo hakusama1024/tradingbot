@@ -240,6 +240,25 @@ class TradingDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_snapshot_on_date(self, snapshot_date: Optional[str] = None) -> Optional[Dict]:
+        target_date = snapshot_date or date.today().isoformat()
+        row = self.conn.execute(
+            "SELECT * FROM daily_snapshots WHERE date = ? LIMIT 1", (target_date,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_snapshots_between(self, start_date: str, end_date: str) -> List[Dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM daily_snapshots
+            WHERE date >= ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_starting_equity(self) -> Optional[float]:
         row = self.conn.execute(
             "SELECT equity FROM daily_snapshots ORDER BY date ASC LIMIT 1"
@@ -405,6 +424,38 @@ class TradingDatabase:
             "gross_filled_notional": gross_filled_notional,
         }
 
+    def get_trades_between(self, start_date: str, end_date: str) -> List[Dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM trades
+            WHERE date(timestamp) >= ? AND date(timestamp) <= ?
+            ORDER BY timestamp ASC
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_trade_summary_between(self, start_date: str, end_date: str) -> Dict[str, Any]:
+        trades = self.get_trades_between(start_date, end_date)
+        filled_trades = [
+            t for t in trades if "fill" in (t.get("status") or "").lower()
+        ]
+        gross_filled_notional = sum(
+            (t.get("filled_qty") or t.get("qty") or 0) * (t.get("filled_price") or 0)
+            for t in filled_trades
+        )
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "total_orders": len(trades),
+            "filled_orders": len(filled_trades),
+            "buy_orders": sum(1 for t in trades if t.get("side") == "buy"),
+            "sell_orders": sum(1 for t in trades if t.get("side") == "sell"),
+            "symbols": sorted({t.get("symbol") for t in trades if t.get("symbol")}),
+            "gross_filled_notional": gross_filled_notional,
+        }
+
     def get_today_pl(self) -> float:
         today = date.today().isoformat()
         row = self.conn.execute(
@@ -445,6 +496,22 @@ class TradingDatabase:
             ORDER BY screen_date DESC
             LIMIT 1
             """
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["approved_symbols"] = json.loads(result.get("approved_symbols_json") or "[]")
+        return result
+
+    def get_screening_batch_on_date(self, screen_date: str) -> Optional[Dict]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM screening_batches
+            WHERE screen_date = ?
+            LIMIT 1
+            """,
+            (screen_date,),
         ).fetchone()
         if row is None:
             return None

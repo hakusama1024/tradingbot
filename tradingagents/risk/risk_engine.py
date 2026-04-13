@@ -176,6 +176,8 @@ class RiskEngine:
         return RiskCheckResult(passed=True)
 
     def _check_max_positions(self, positions: List[Position]) -> RiskCheckResult:
+        if self.max_open_positions is None or self.max_open_positions <= 0:
+            return RiskCheckResult(passed=True)
         if len(positions) >= self.max_open_positions:
             return RiskCheckResult(
                 passed=False,

@@ -461,6 +461,171 @@ class Orchestrator:
             dedupe_key=f"miss-review:{report.get('date')}",
         )
 
+    def _build_fallback_daily_report(self, report_date: Optional[str] = None) -> Dict:
+        report_day = report_date or date.today().isoformat()
+        snapshot = self.db.get_snapshot_on_date(report_day) or {}
+        screening_batch = self.db.get_screening_batch_on_date(report_day) or {}
+        setups = self.db.get_setup_candidates_on_date(report_day)
+        trades = self.db.get_trades_on_date(report_day)
+        trade_summary = self.db.get_trade_summary(report_day)
+
+        positions = []
+        raw_positions = snapshot.get("positions_json")
+        if raw_positions:
+            try:
+                positions = json.loads(raw_positions)
+            except Exception:
+                positions = []
+
+        total_unrealized_pl = sum(
+            float((row or {}).get("unrealized_pl") or 0.0) for row in positions
+        )
+
+        report = {
+            "date": report_day,
+            "account": {
+                "equity": float(snapshot.get("equity") or 0.0),
+                "cash": float(snapshot.get("cash") or 0.0),
+                "buying_power": float(snapshot.get("buying_power") or 0.0),
+                "portfolio_value": float(snapshot.get("portfolio_value") or 0.0),
+                "daily_pl": float(snapshot.get("daily_pl") or 0.0),
+                "daily_pl_pct": float(snapshot.get("daily_pl_pct") or 0.0),
+            },
+            "trade_summary": trade_summary,
+            "trades": trades,
+            "setups": setups,
+            "screening_batch": screening_batch,
+            "positions": positions,
+            "position_summary": {
+                "open_positions": len(positions),
+                "total_unrealized_pl": total_unrealized_pl,
+            },
+            "performance": self.tracker.get_performance_summary(),
+            "paper_mode": self.config.get("paper_trading", True),
+            "watchlist": self.watchlist,
+            "fallback_used": True,
+        }
+        report["miss_review"] = self._build_miss_review(report)
+        return report
+
+    def _safe_generate_daily_report(
+        self, save: bool = True, report_date: Optional[str] = None
+    ) -> Dict:
+        try:
+            return self.generate_daily_report(save=save, report_date=report_date)
+        except Exception as exc:
+            logger.warning(
+                "Falling back to DB-backed daily report for %s: %s",
+                report_date or date.today().isoformat(),
+                exc,
+                exc_info=True,
+            )
+            report = self._build_fallback_daily_report(report_date)
+            report["fallback_reason"] = str(exc)
+            if save:
+                output_dir = os.path.join(
+                    self.config.get("results_dir", "./results"),
+                    "daily_reports",
+                )
+                report_path = self.tracker.save_daily_report(report, output_dir)
+                report["report_path"] = str(report_path)
+                logger.info("Fallback daily report saved to %s", report_path)
+            return report
+
+    def send_daily_notifications(self, report_date: Optional[str] = None) -> Dict:
+        report = self._safe_generate_daily_report(save=True, report_date=report_date)
+        self._notify_daily_summary(report)
+        self._notify_miss_review(report)
+        return {
+            "date": report.get("date"),
+            "report_path": report.get("report_path"),
+            "fallback_used": bool(report.get("fallback_used")),
+        }
+
+    def send_weekly_summary(self, week_end_date: Optional[str] = None) -> Dict:
+        if (
+            not self.notifier.enabled
+            or not self.config.get("ntfy_weekly_summary_enabled", True)
+        ):
+            return {"enabled": False}
+
+        end_day = datetime.fromisoformat(
+            week_end_date or date.today().isoformat()
+        ).date()
+        start_day = end_day - timedelta(days=end_day.weekday())
+        start_date = start_day.isoformat()
+        end_date = end_day.isoformat()
+
+        snapshots = self.db.get_snapshots_between(start_date, end_date)
+        trade_summary = self.db.get_trade_summary_between(start_date, end_date)
+
+        week_pl = sum(float(row.get("daily_pl") or 0.0) for row in snapshots)
+        positive_days = sum(1 for row in snapshots if float(row.get("daily_pl") or 0.0) > 0)
+        negative_days = sum(1 for row in snapshots if float(row.get("daily_pl") or 0.0) < 0)
+
+        week_return = 0.0
+        if snapshots:
+            first_equity = float(snapshots[0].get("equity") or 0.0)
+            first_daily_pl = float(snapshots[0].get("daily_pl") or 0.0)
+            start_equity = first_equity - first_daily_pl
+            end_equity = float(snapshots[-1].get("equity") or 0.0)
+            if start_equity > 0:
+                week_return = (end_equity - start_equity) / start_equity
+        else:
+            end_equity = 0.0
+
+        best_day = max(
+            snapshots,
+            key=lambda row: float(row.get("daily_pl") or 0.0),
+            default=None,
+        )
+        worst_day = min(
+            snapshots,
+            key=lambda row: float(row.get("daily_pl") or 0.0),
+            default=None,
+        )
+
+        lines = [
+            f"Week: {start_date} to {end_date}",
+            f"Week P/L: ${week_pl:,.2f}",
+            f"Week return: {week_return:.2%}",
+            f"Trading days: {len(snapshots)}",
+            f"Up days: {positive_days}",
+            f"Down days: {negative_days}",
+            f"Orders: {trade_summary.get('total_orders', 0)}",
+            f"Filled: {trade_summary.get('filled_orders', 0)}",
+        ]
+
+        symbols = trade_summary.get("symbols") or []
+        if symbols:
+            lines.append("Symbols traded: " + ", ".join(symbols[:12]))
+        if best_day is not None:
+            lines.append(
+                "Best day: "
+                f"{best_day.get('date')} (${float(best_day.get('daily_pl') or 0.0):,.2f})"
+            )
+        if worst_day is not None:
+            lines.append(
+                "Worst day: "
+                f"{worst_day.get('date')} (${float(worst_day.get('daily_pl') or 0.0):,.2f})"
+            )
+        lines.append(f"Ending equity: ${end_equity:,.2f}")
+
+        self.notifier.send(
+            "TradingAgents Weekly Summary",
+            "\n".join(lines),
+            priority="default",
+            tags=["calendar", "bar_chart", "moneybag"],
+            dedupe_key=f"weekly-summary:{end_date}",
+        )
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "week_pl": week_pl,
+            "week_return": week_return,
+            "orders": trade_summary.get("total_orders", 0),
+        }
+
     def _build_screen_rejection(self, symbol: str, preflight) -> Dict:
         base = {
             "symbol": symbol,
@@ -697,6 +862,21 @@ class Orchestrator:
         if order_request is None:
             logger.info(f"{symbol}: No trade needed (action={structured['action']})")
             return {"symbol": symbol, "action": structured["action"], "traded": False}
+
+        existing_open_order = self._find_existing_open_order(symbol, order_request.side)
+        if existing_open_order is not None:
+            reason = (
+                f"Existing open {order_request.side} order "
+                f"{existing_open_order.order_id} [{existing_open_order.status}]"
+            )
+            logger.info(f"{symbol}: {reason}")
+            self.db.mark_signal_rejected(signal_id, reason)
+            return {
+                "symbol": symbol,
+                "action": structured["action"],
+                "traded": False,
+                "screen_rejected": reason,
+            }
 
         # 5. Risk check
         risk_result = self.risk_engine.check_order(
@@ -1001,10 +1181,11 @@ class Orchestrator:
                 logger.error(f"Reflection error for {pos.symbol}: {e}")
 
         self._save_persistent_memories()
-        self.tracker.take_daily_snapshot()
-        report = self.generate_daily_report(save=True)
-        self._notify_daily_summary(report)
-        self._notify_miss_review(report)
+        try:
+            self.tracker.take_daily_snapshot()
+        except Exception as exc:
+            logger.warning("Daily snapshot failed during reflection: %s", exc, exc_info=True)
+        summary_result = self.send_daily_notifications()
 
         logger.info(
             "Reflection complete. Reflected on %s positions, skipped %s.",
@@ -1014,7 +1195,8 @@ class Orchestrator:
         return {
             "reflected": reflected,
             "skipped": skipped,
-            "report_path": report.get("report_path"),
+            "report_path": summary_result.get("report_path"),
+            "fallback_used": summary_result.get("fallback_used", False),
         }
 
     def generate_daily_report(
@@ -1350,6 +1532,20 @@ class Orchestrator:
                 qty=float(qty),
                 order_type="market",
             )
+            existing_open_order = self._find_existing_open_order(symbol, side)
+            if existing_open_order is not None:
+                reason = (
+                    f"Existing open {side} order "
+                    f"{existing_open_order.order_id} [{existing_open_order.status}]"
+                )
+                self.db.mark_signal_rejected(signal_id, reason)
+                return {
+                    "symbol": symbol,
+                    "action": action,
+                    "traded": False,
+                    "risk_rejected": reason,
+                    "overlay_managed": True,
+                }
             order_result = self.broker.submit_order(order_request)
         except Exception as exc:
             self.db.mark_signal_rejected(signal_id, str(exc))
@@ -1533,6 +1729,34 @@ class Orchestrator:
         for p in positions:
             if p.symbol == symbol:
                 return p
+        return None
+
+    def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
+        getter = getattr(self.broker, "get_open_orders", None)
+        if not callable(getter):
+            return None
+        try:
+            orders = getter(symbol=symbol)
+        except TypeError:
+            orders = getter()
+        except Exception as exc:
+            logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
+            return None
+
+        target_symbol = symbol.upper()
+        target_side = side.lower() if side else None
+        terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        for order in orders or []:
+            order_symbol = str(getattr(order, "symbol", "") or "").upper()
+            order_side = str(getattr(order, "side", "") or "").lower()
+            order_status = str(getattr(order, "status", "") or "").lower()
+            if order_symbol != target_symbol:
+                continue
+            if target_side and order_side != target_side:
+                continue
+            if order_status in terminal_statuses:
+                continue
+            return order
         return None
 
     def _target_exposure_for_regime(self, regime: Optional[str]) -> float:

@@ -11,8 +11,9 @@ from alpaca.trading.requests import (
     StopLimitOrderRequest,
     TrailingStopOrderRequest,
     ClosePositionRequest,
+    GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -176,6 +177,11 @@ class AlpacaBroker(BaseBroker):
     def get_order(self, order_id: str) -> OrderResult:
         raw = self.trading_client.get_order_by_id(order_id)
         return self._to_order_result(raw)
+
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol] if symbol else None)
+        raw = self.trading_client.get_orders(filter=req)
+        return [self._to_order_result(order) for order in raw]
 
     @staticmethod
     def _to_order_result(o) -> OrderResult:

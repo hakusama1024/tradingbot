@@ -103,6 +103,46 @@ class TradingScheduler:
         )
         logger.info(f"Scheduled daily reflection at {reflection_time} ET (Mon-Fri)")
 
+        daily_summary_time = self.config.get("daily_summary_time", "16:40")
+        hour, minute = daily_summary_time.split(":")
+        self.scheduler.add_job(
+            self._run_with_logging,
+            args=[self.orchestrator.send_daily_notifications, "Daily Summary Push"],
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=int(hour),
+                minute=int(minute),
+                timezone="US/Eastern",
+            ),
+            id="daily_summary_push",
+            name="Daily Summary Push",
+            misfire_grace_time=600,
+        )
+        logger.info(
+            "Scheduled daily summary push at %s ET (Mon-Fri)",
+            daily_summary_time,
+        )
+
+        weekly_summary_time = self.config.get("weekly_summary_time", "16:45")
+        hour, minute = weekly_summary_time.split(":")
+        self.scheduler.add_job(
+            self._run_with_logging,
+            args=[self.orchestrator.send_weekly_summary, "Weekly Summary Push"],
+            trigger=CronTrigger(
+                day_of_week="fri",
+                hour=int(hour),
+                minute=int(minute),
+                timezone="US/Eastern",
+            ),
+            id="weekly_summary_push",
+            name="Weekly Summary Push",
+            misfire_grace_time=900,
+        )
+        logger.info(
+            "Scheduled weekly summary push at %s ET (Fri)",
+            weekly_summary_time,
+        )
+
         if self.config.get("social_monitor_enabled", False):
             interval = max(int(self.config.get("social_check_interval_minutes", 30)), 1)
             self.scheduler.add_job(
