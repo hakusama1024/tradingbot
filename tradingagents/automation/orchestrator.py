@@ -10,8 +10,9 @@ import traceback
 import json
 from collections import Counter
 from datetime import date, datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
+import pandas as pd
 from tradingagents.broker.alpaca_broker import AlpacaBroker
 from tradingagents.broker.models import Account, Position
 from tradingagents.risk.risk_engine import RiskEngine
@@ -38,6 +39,7 @@ class Orchestrator:
         self._latest_minervini_preflight = None
         self._active_universe: list[str] = list(self.watchlist)
         self._latest_overlay_context: Optional[Dict] = None
+        self._latest_market_context: Optional[Dict] = None
 
         # Broker
         self.broker = AlpacaBroker(
@@ -697,7 +699,7 @@ class Orchestrator:
         # First check existing positions for SELL signals
         for pos in stock_positions:
             try:
-                result = self._analyze_and_trade(pos.symbol, account, stock_positions)
+                result = self._manage_existing_position(pos, account, stock_positions)
                 results[pos.symbol] = result
             except Exception as e:
                 logger.error(f"Error analyzing {pos.symbol}: {e}")
@@ -908,10 +910,15 @@ class Orchestrator:
                 tp_price = self.risk_engine.get_take_profit_price(
                     current_price, structured.get("take_profit_pct")
                 )
+            if self.config.get("minervini_use_stop_only_entries", True):
+                tp_price = None
             order_result = self.broker.submit_bracket_order(
                 order_request, stop_loss_price=sl_price, take_profit_price=tp_price
             )
-            logger.info(f"{symbol}: Bracket order SL=${sl_price:.2f} TP=${tp_price:.2f}")
+            if tp_price is None:
+                logger.info(f"{symbol}: Protected entry order SL=${sl_price:.2f} (no fixed TP)")
+            else:
+                logger.info(f"{symbol}: Bracket order SL=${sl_price:.2f} TP=${tp_price:.2f}")
         else:
             order_result = self.broker.submit_order(order_request)
 
@@ -957,6 +964,813 @@ class Orchestrator:
             "order_id": order_result.order_id,
             "status": order_result.status,
         }
+
+    def _manage_existing_position(
+        self,
+        position: Position,
+        account: Account,
+        positions: List[Position],
+    ) -> Dict:
+        if self._is_overlay_symbol(position.symbol):
+            return {
+                "symbol": position.symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": "Overlay position managed separately",
+            }
+
+        if self.config.get("minervini_live_exit_enabled", True):
+            state = self._build_minervini_position_state(position)
+            if state is None:
+                return {
+                    "symbol": position.symbol,
+                    "action": "HOLD",
+                    "traded": False,
+                    "screen_rejected": "Missing exit-history context for Minervini management",
+                }
+
+            management_state = self._load_position_management_state(position.symbol, state)
+
+            exit_result = self._trade_minervini_position_exit(position, state=state)
+            if exit_result is not None:
+                if exit_result.get("traded"):
+                    self.db.delete_position_management_state(position.symbol)
+                return exit_result
+
+            deferred_reason = None
+
+            partial_result = self._trade_minervini_partial_profit(
+                position=position,
+                state=state,
+                management_state=management_state,
+            )
+            if partial_result is not None:
+                if partial_result.get("traded"):
+                    return partial_result
+                deferred_reason = partial_result.get("screen_rejected") or deferred_reason
+
+            add_on_result = self._trade_minervini_add_on(
+                position=position,
+                state=state,
+                management_state=management_state,
+                account=account,
+                positions=positions,
+            )
+            if add_on_result is not None:
+                if add_on_result.get("traded"):
+                    return add_on_result
+                deferred_reason = add_on_result.get("screen_rejected") or deferred_reason
+
+            self._persist_position_management_state(position.symbol, management_state)
+            self._sync_minervini_protective_stop(position, state)
+            return {
+                "symbol": position.symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": deferred_reason
+                or "Holding above Minervini profit-protection levels",
+            }
+
+        return self._analyze_and_trade(position.symbol, account, positions)
+
+    def _trade_minervini_position_exit(
+        self,
+        position: Position,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
+        state = state or self._build_minervini_position_state(position)
+        if state is None:
+            return None
+
+        exit_signal = self._evaluate_minervini_position_exit(position, state)
+        if exit_signal is None:
+            return None
+
+        symbol = position.symbol
+        signal_id = self.db.log_signal(
+            symbol=symbol,
+            action="SELL",
+            confidence=0.85,
+            reasoning=exit_signal["reason"],
+            timeframe="swing",
+            full_analysis=json.dumps(exit_signal, default=str),
+        )
+
+        try:
+            canceled = self._cancel_open_orders(symbol, side="sell")
+            if canceled:
+                logger.info("%s: canceled %s existing sell order(s) before exit", symbol, len(canceled))
+            order_result = self.broker.close_position(symbol)
+        except Exception as exc:
+            self.db.mark_signal_rejected(signal_id, str(exc))
+            logger.error("Rule-based exit failed for %s: %s", symbol, exc, exc_info=True)
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "traded": False,
+                "risk_rejected": str(exc),
+            }
+
+        self.db.log_trade(
+            symbol=symbol,
+            side="sell",
+            qty=float(position.qty),
+            order_type="market",
+            status=order_result.status,
+            filled_qty=order_result.filled_qty,
+            filled_price=order_result.filled_avg_price,
+            order_id=order_result.order_id,
+            signal_id=signal_id,
+            reasoning=exit_signal["reason"],
+        )
+        self.db.mark_signal_executed(signal_id)
+        self._notify_order(
+            symbol=symbol,
+            side="sell",
+            qty=float(position.qty),
+            status=str(order_result.status),
+            order_id=order_result.order_id,
+            filled_price=order_result.filled_avg_price,
+            reasoning=exit_signal["reason"],
+            source="minervini_exit",
+        )
+        return {
+            "symbol": symbol,
+            "action": "SELL",
+            "traded": True,
+            "side": "sell",
+            "qty": float(position.qty),
+            "order_id": order_result.order_id,
+            "status": order_result.status,
+            "rule_exit": exit_signal["trigger"],
+        }
+
+    def _trade_minervini_partial_profit(
+        self,
+        *,
+        position: Position,
+        state: Dict[str, Any],
+        management_state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.config.get("minervini_partial_profit_enabled", True):
+            return None
+        if management_state.get("partial_profit_taken"):
+            return None
+
+        trigger_pct = float(self.config.get("minervini_partial_profit_trigger_pct", 0.12))
+        fraction = float(self.config.get("minervini_partial_profit_fraction", 0.33))
+        current_gain_pct = float(state.get("current_gain_pct") or 0.0)
+        if current_gain_pct < trigger_pct:
+            return None
+
+        total_qty = int(float(position.qty or 0))
+        if total_qty <= 1:
+            return None
+        sell_qty = min(total_qty - 1, max(1, int(total_qty * fraction)))
+        if sell_qty <= 0:
+            return None
+
+        symbol = position.symbol
+        open_sell_orders = self._get_open_orders(symbol, side="sell")
+        if open_sell_orders:
+            canceled = self._cancel_open_orders(symbol, side="sell")
+            reason = (
+                f"Refreshing {len(canceled)} protective sell order(s) before partial profit"
+                if canceled
+                else "Waiting for existing protective sell orders to clear before partial profit"
+            )
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": reason,
+            }
+
+        reason = (
+            f"Minervini partial profit: {symbol} is up {current_gain_pct:.1%}; "
+            f"locking in {sell_qty} shares while keeping the core position."
+        )
+        signal_id = self.db.log_signal(
+            symbol=symbol,
+            action="SELL",
+            confidence=0.8,
+            reasoning=reason,
+            timeframe="swing",
+            full_analysis=json.dumps(
+                {
+                    "symbol": symbol,
+                    "trigger": "partial_profit",
+                    "current_gain_pct": current_gain_pct,
+                    "sell_qty": sell_qty,
+                },
+                default=str,
+            ),
+        )
+
+        try:
+            order_result = self.broker.submit_order(
+                OrderRequest(
+                    symbol=symbol,
+                    side="sell",
+                    qty=float(sell_qty),
+                    order_type="market",
+                )
+            )
+        except Exception as exc:
+            self.db.mark_signal_rejected(signal_id, str(exc))
+            logger.error("Partial-profit sell failed for %s: %s", symbol, exc, exc_info=True)
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "traded": False,
+                "risk_rejected": str(exc),
+            }
+
+        self.db.log_trade(
+            symbol=symbol,
+            side="sell",
+            qty=float(sell_qty),
+            order_type="market",
+            status=order_result.status,
+            filled_qty=order_result.filled_qty,
+            filled_price=order_result.filled_avg_price,
+            order_id=order_result.order_id,
+            signal_id=signal_id,
+            reasoning=reason,
+        )
+        self.db.mark_signal_executed(signal_id)
+        management_state["partial_profit_taken"] = True
+        self._persist_position_management_state(symbol, management_state)
+        self._notify_order(
+            symbol=symbol,
+            side="sell",
+            qty=float(sell_qty),
+            status=str(order_result.status),
+            order_id=order_result.order_id,
+            filled_price=order_result.filled_avg_price,
+            reasoning=reason,
+            source="minervini_partial_profit",
+        )
+        return {
+            "symbol": symbol,
+            "action": "SELL",
+            "traded": True,
+            "side": "sell",
+            "qty": float(sell_qty),
+            "order_id": order_result.order_id,
+            "status": order_result.status,
+            "rule_exit": "partial_profit",
+        }
+
+    def _trade_minervini_add_on(
+        self,
+        *,
+        position: Position,
+        state: Dict[str, Any],
+        management_state: Dict[str, Any],
+        account: Account,
+        positions: List[Position],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.config.get("minervini_add_on_enabled", True):
+            return None
+        if management_state.get("partial_profit_taken"):
+            return {
+                "symbol": position.symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": "Add-on disabled after partial-profit lock",
+            }
+        market_context = self._get_market_context()
+        if self._market_extended_for_add_on(market_context):
+            return {
+                "symbol": position.symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    "Add-on blocked because QQQ is stretched above the 21EMA or running too fast"
+                ),
+            }
+
+        symbol = position.symbol
+        setup = self._get_latest_setup_for_symbol(symbol)
+        if not self._setup_supports_pyramiding(setup, state.get("current_price")):
+            return None
+
+        current_price = self._to_float(state.get("current_price"))
+        entry_price = self._to_float(state.get("entry_price"))
+        if current_price is None or entry_price is None or current_price <= entry_price:
+            return None
+
+        add_on_level = None
+        add_fraction = None
+        first_trigger = float(self.config.get("minervini_add_on_trigger_pct_1", 0.025))
+        second_trigger = float(self.config.get("minervini_add_on_trigger_pct_2", 0.05))
+        if (
+            not management_state.get("add_on_1_done")
+            and current_price >= entry_price * (1.0 + first_trigger)
+        ):
+            add_on_level = 1
+            add_fraction = float(self.config.get("minervini_add_on_fraction_1", 0.30))
+        elif (
+            not management_state.get("add_on_2_done")
+            and current_price >= entry_price * (1.0 + second_trigger)
+        ):
+            add_on_level = 2
+            add_fraction = float(self.config.get("minervini_add_on_fraction_2", 0.20))
+
+        if add_on_level is None or add_fraction is None:
+            return None
+
+        market_regime = setup.get("market_regime") or (
+            self._latest_minervini_preflight.market_regime
+            if self._latest_minervini_preflight is not None
+            else "unknown"
+        )
+        if not self._entries_allowed_for_setup(setup, market_regime):
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": f"Add-on blocked in market regime {market_regime}",
+            }
+
+        current_exposure = self._current_exposure(account, positions)
+        target_exposure = self._target_exposure_for_setup(setup, market_regime)
+        if current_exposure >= target_exposure:
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    f"Exposure {current_exposure:.2%} already at add-on target {target_exposure:.2%}"
+                ),
+            }
+
+        existing_open_buy_order = self._find_existing_open_order(symbol, side="buy")
+        if existing_open_buy_order is not None:
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    f"Existing open buy order {existing_open_buy_order.order_id} "
+                    f"[{existing_open_buy_order.status}]"
+                ),
+            }
+
+        open_sell_orders = self._get_open_orders(symbol, side="sell")
+        order_type_names = {
+            self._order_type_name(getattr(order, "order_type", "")) for order in open_sell_orders
+        }
+        if "limit" in order_type_names:
+            canceled = self._cancel_open_orders(symbol, side="sell")
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    f"Refreshing {len(canceled)} legacy sell order(s) before add-on"
+                    if canceled
+                    else "Waiting for legacy sell orders to clear before add-on"
+                ),
+            }
+
+        stop_price = max(
+            self._to_float(setup.get("initial_stop_price")) or 0.0,
+            self._to_float(state.get("protective_stop_price")) or 0.0,
+        )
+        if stop_price <= 0 or stop_price >= current_price:
+            return None
+
+        qty = self._calculate_add_on_qty(
+            account=account,
+            positions=positions,
+            position=position,
+            price=current_price,
+            stop_price=stop_price,
+            add_fraction=add_fraction,
+        )
+        if qty <= 0:
+            return None
+
+        reasoning = (
+            f"Minervini add-on #{add_on_level}: {symbol} remains in a strong continuation "
+            f"setup at {current_price:.2f}; adding {qty} shares with protection at {stop_price:.2f}."
+        )
+        signal_id = self.db.log_signal(
+            symbol=symbol,
+            action="BUY",
+            confidence=0.82,
+            reasoning=reasoning,
+            stop_loss=stop_price,
+            timeframe="swing",
+            full_analysis=json.dumps(setup, default=str),
+        )
+
+        order_request = OrderRequest(symbol=symbol, side="buy", qty=float(qty))
+        risk_result = self.risk_engine.check_order(order_request, account, positions, current_price)
+        if not risk_result.passed:
+            self.db.mark_signal_rejected(signal_id, risk_result.reason)
+            return {
+                "symbol": symbol,
+                "action": "BUY",
+                "traded": False,
+                "risk_rejected": risk_result.reason,
+            }
+
+        try:
+            order_result = self.broker.submit_bracket_order(
+                order_request,
+                stop_loss_price=round(stop_price, 2),
+                take_profit_price=None,
+            )
+        except Exception as exc:
+            self.db.mark_signal_rejected(signal_id, str(exc))
+            logger.error("Add-on buy failed for %s: %s", symbol, exc, exc_info=True)
+            return {
+                "symbol": symbol,
+                "action": "BUY",
+                "traded": False,
+                "risk_rejected": str(exc),
+            }
+
+        self.risk_engine.record_trade()
+        self.db.log_trade(
+            symbol=symbol,
+            side="buy",
+            qty=float(qty),
+            order_type="oto",
+            status=order_result.status,
+            filled_qty=order_result.filled_qty,
+            filled_price=order_result.filled_avg_price,
+            order_id=order_result.order_id,
+            signal_id=signal_id,
+            reasoning=reasoning,
+        )
+        self.db.mark_signal_executed(signal_id)
+        management_state[f"add_on_{add_on_level}_done"] = True
+        self._persist_position_management_state(symbol, management_state)
+        self._notify_order(
+            symbol=symbol,
+            side="buy",
+            qty=float(qty),
+            status=str(order_result.status),
+            order_id=order_result.order_id,
+            filled_price=order_result.filled_avg_price,
+            reasoning=reasoning,
+            source=f"minervini_add_on_{add_on_level}",
+        )
+        return {
+            "symbol": symbol,
+            "action": "BUY",
+            "traded": True,
+            "side": "buy",
+            "qty": float(qty),
+            "order_id": order_result.order_id,
+            "status": order_result.status,
+            "rule_entry": f"add_on_{add_on_level}",
+        }
+
+    def _evaluate_minervini_position_exit(
+        self,
+        position: Position,
+        state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        entry_price = state["entry_price"]
+        current_price = state["current_price"]
+        max_gain_pct = state["max_gain_pct"]
+        current_gain_pct = state["current_gain_pct"]
+        ema21 = state.get("ema21")
+
+        breakeven_trigger = float(self.config.get("minervini_breakeven_trigger_pct", 0.10))
+        trailing_lock_trigger_1 = float(
+            self.config.get("minervini_trailing_lock_trigger_pct_1", 0.12)
+        )
+        trailing_lock_floor_1 = float(
+            self.config.get("minervini_trailing_lock_floor_pct_1", 0.03)
+        )
+        trailing_lock_trigger_2 = float(
+            self.config.get("minervini_trailing_lock_trigger_pct_2", 0.20)
+        )
+        trailing_lock_floor_2 = float(
+            self.config.get("minervini_trailing_lock_floor_pct_2", 0.08)
+        )
+        ema21_floor = float(self.config.get("minervini_ema21_profit_floor_pct", 0.10))
+        ema21_break_buffer = float(self.config.get("minervini_ema21_break_buffer_pct", 0.0025))
+        protective_stop_price = self._to_float(state.get("protective_stop_price"))
+
+        if max_gain_pct >= breakeven_trigger and current_price <= state["breakeven_floor_price"]:
+            return {
+                "symbol": position.symbol,
+                "trigger": "breakeven_protect",
+                "reason": (
+                    f"Minervini profit protection: {position.symbol} reached "
+                    f"{max_gain_pct:.1%} max gain and round-tripped to {current_gain_pct:.1%}; "
+                    "exit before a winner turns into a loser."
+                ),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "max_gain_pct": max_gain_pct,
+                "current_gain_pct": current_gain_pct,
+            }
+
+        trailing_floor_price = None
+        trailing_trigger = None
+        if max_gain_pct >= trailing_lock_trigger_2:
+            trailing_floor_price = entry_price * (1.0 + trailing_lock_floor_2)
+            trailing_trigger = trailing_lock_trigger_2
+        elif max_gain_pct >= trailing_lock_trigger_1:
+            trailing_floor_price = entry_price * (1.0 + trailing_lock_floor_1)
+            trailing_trigger = trailing_lock_trigger_1
+
+        if (
+            trailing_floor_price is not None
+            and protective_stop_price is not None
+            and current_price <= protective_stop_price
+        ):
+            return {
+                "symbol": position.symbol,
+                "trigger": "trailing_profit_stop",
+                "reason": (
+                    f"Minervini trailing stop: {position.symbol} reached "
+                    f"{max_gain_pct:.1%} max gain, activated the "
+                    f"{trailing_trigger:.0%} profit-lock ladder, and fell back to "
+                    f"the protective stop ({current_price:.2f} <= {protective_stop_price:.2f})."
+                ),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "protective_stop_price": protective_stop_price,
+                "max_gain_pct": max_gain_pct,
+                "current_gain_pct": current_gain_pct,
+            }
+
+        if (
+            ema21 is not None
+            and max_gain_pct >= ema21_floor
+            and current_price < ema21 * (1.0 - ema21_break_buffer)
+        ):
+            return {
+                "symbol": position.symbol,
+                "trigger": "lost_21ema",
+                "reason": (
+                    f"Minervini profit protection: {position.symbol} reached "
+                    f"{max_gain_pct:.1%} max gain and is now below the 21EMA "
+                    f"({current_price:.2f} < {ema21:.2f})."
+                ),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "ema21": float(ema21),
+                "max_gain_pct": max_gain_pct,
+                "current_gain_pct": current_gain_pct,
+            }
+
+        return None
+
+    def _build_minervini_position_state(self, position: Position) -> Optional[Dict[str, Any]]:
+        entry_price = float(position.avg_entry_price or 0.0)
+        current_price = float(position.current_price or 0.0)
+        if entry_price <= 0 or current_price <= 0:
+            return None
+
+        history = self._load_position_exit_history(position.symbol)
+        if history.empty:
+            return None
+
+        entry_trade_date = self._get_position_entry_date(position.symbol)
+        if entry_trade_date is None:
+            entry_trade_date = history.index[-1].date() - timedelta(days=30)
+
+        bars_since_entry = history[history.index.date >= entry_trade_date]
+        if bars_since_entry.empty:
+            bars_since_entry = history.tail(40)
+
+        ema21 = history["close"].ewm(span=21, adjust=False).mean().iloc[-1] if len(history) >= 21 else None
+        current_gain_pct = (current_price / entry_price) - 1.0
+        max_price_since_entry = max(float(bars_since_entry["high"].max()), current_price)
+        max_gain_pct = (max_price_since_entry / entry_price) - 1.0
+
+        breakeven_buffer = float(self.config.get("minervini_breakeven_buffer_pct", 0.003))
+        breakeven_trigger = float(self.config.get("minervini_breakeven_trigger_pct", 0.08))
+        trailing_lock_trigger_1 = float(
+            self.config.get("minervini_trailing_lock_trigger_pct_1", 0.12)
+        )
+        trailing_lock_floor_1 = float(
+            self.config.get("minervini_trailing_lock_floor_pct_1", 0.03)
+        )
+        trailing_lock_trigger_2 = float(
+            self.config.get("minervini_trailing_lock_trigger_pct_2", 0.20)
+        )
+        trailing_lock_floor_2 = float(
+            self.config.get("minervini_trailing_lock_floor_pct_2", 0.08)
+        )
+        ema21_floor = float(self.config.get("minervini_ema21_profit_floor_pct", 0.10))
+        ema21_break_buffer = float(self.config.get("minervini_ema21_break_buffer_pct", 0.0025))
+        base_stop_pct = min(
+            float(self.config.get("default_stop_loss_pct", 0.08)),
+            float(self.config.get("leader_continuation_stop_loss_pct", 0.06)),
+        )
+        protective_stop_price = entry_price * (1.0 - base_stop_pct)
+        breakeven_floor_price = entry_price * (1.0 + breakeven_buffer)
+        trailing_floor_price = None
+        if max_gain_pct >= trailing_lock_trigger_2:
+            trailing_floor_price = entry_price * (1.0 + trailing_lock_floor_2)
+        elif max_gain_pct >= trailing_lock_trigger_1:
+            trailing_floor_price = entry_price * (1.0 + trailing_lock_floor_1)
+        if max_gain_pct >= breakeven_trigger:
+            protective_stop_price = max(protective_stop_price, breakeven_floor_price)
+        if trailing_floor_price is not None:
+            protective_stop_price = max(protective_stop_price, trailing_floor_price)
+        if ema21 is not None and max_gain_pct >= ema21_floor:
+            protective_stop_price = max(
+                protective_stop_price,
+                ema21 * (1.0 - ema21_break_buffer),
+            )
+        protective_stop_price = min(protective_stop_price, current_price * 0.995)
+
+        return {
+            "symbol": position.symbol,
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "ema21": float(ema21) if ema21 is not None else None,
+            "max_gain_pct": max_gain_pct,
+            "current_gain_pct": current_gain_pct,
+            "breakeven_floor_price": breakeven_floor_price,
+            "trailing_floor_price": trailing_floor_price,
+            "protective_stop_price": round(protective_stop_price, 2),
+            "entry_trade_date": entry_trade_date.isoformat(),
+        }
+
+    def _sync_minervini_protective_stop(
+        self,
+        position: Position,
+        state: Dict[str, Any],
+    ) -> None:
+        if not self.config.get("minervini_use_stop_only_entries", True):
+            return
+
+        symbol = position.symbol
+        desired_stop = self._to_float(state.get("protective_stop_price"))
+        current_price = self._to_float(state.get("current_price"))
+        if desired_stop is None or current_price is None or desired_stop >= current_price:
+            return
+
+        open_sell_orders = self._get_open_orders(symbol, side="sell")
+        order_type_names = {
+            self._order_type_name(getattr(order, "order_type", "")) for order in open_sell_orders
+        }
+        has_limit_child = "limit" in order_type_names
+        stop_children = [
+            order
+            for order in open_sell_orders
+            if self._order_type_name(getattr(order, "order_type", "")) in {"stop", "stop_limit", "trailing_stop"}
+        ]
+        has_stop_child = bool(stop_children)
+
+        if has_stop_child and not has_limit_child:
+            exact_stop = any(
+                abs((self._to_float(getattr(order, "stop_price", None)) or -1.0) - desired_stop) < 0.01
+                and abs((self._to_float(getattr(order, "qty", None)) or 0.0) - float(position.qty)) < 0.01
+                for order in stop_children
+            )
+            if exact_stop:
+                return
+
+        if open_sell_orders:
+            canceled = self._cancel_open_orders(symbol, side="sell")
+            if canceled:
+                logger.info(
+                    "%s: refreshing %s existing sell order(s) for updated stop-only protection",
+                    symbol,
+                    len(canceled),
+                )
+
+        stop_order = OrderRequest(
+            symbol=symbol,
+            side="sell",
+            qty=float(position.qty),
+            order_type="stop",
+            stop_price=round(desired_stop, 2),
+            time_in_force="gtc",
+        )
+        try:
+            result = self.broker.submit_order(stop_order)
+            logger.info(
+                "%s: protective stop synced at %.2f -> %s",
+                symbol,
+                desired_stop,
+                result.status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s: could not sync protective stop %.2f: %s",
+                symbol,
+                desired_stop,
+                exc,
+            )
+
+    def _get_position_entry_date(self, symbol: str) -> Optional[date]:
+        inferred = self._infer_position_management_from_trades(symbol)
+        return inferred.get("cycle_entry_date")
+
+    def _infer_position_management_from_trades(self, symbol: str) -> Dict[str, Any]:
+        trades = self.db.get_trades_for_symbol(symbol)
+        if not trades:
+            return {
+                "cycle_entry_date": None,
+                "partial_profit_taken": False,
+                "add_on_1_done": False,
+                "add_on_2_done": False,
+            }
+
+        def _parse_trade_date(value: Any) -> Optional[date]:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError:
+                try:
+                    return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").date()
+                except ValueError:
+                    return None
+
+        ordered_trades = sorted(
+            trades,
+            key=lambda trade: str(trade.get("timestamp") or ""),
+        )
+        running_qty = 0.0
+        cycle_entry_date: Optional[date] = None
+        cycle_buy_legs = 0
+        partial_profit_taken = False
+
+        for trade in ordered_trades:
+            qty = float(trade.get("filled_qty") or trade.get("qty") or 0.0)
+            if qty <= 0:
+                continue
+            side = str(trade.get("side") or "").lower()
+            trade_date = _parse_trade_date(trade.get("timestamp"))
+            if trade_date is None:
+                continue
+
+            if side == "buy":
+                if running_qty <= 0:
+                    cycle_entry_date = trade_date
+                    cycle_buy_legs = 0
+                    partial_profit_taken = False
+                running_qty += qty
+                cycle_buy_legs += 1
+                continue
+
+            if side == "sell":
+                if running_qty > 0:
+                    partial_profit_taken = True
+                running_qty = max(0.0, running_qty - qty)
+                if running_qty <= 0:
+                    cycle_entry_date = None
+                    cycle_buy_legs = 0
+                    partial_profit_taken = False
+
+        return {
+            "cycle_entry_date": cycle_entry_date,
+            "partial_profit_taken": partial_profit_taken if running_qty > 0 else False,
+            "add_on_1_done": cycle_buy_legs >= 2 if running_qty > 0 else False,
+            "add_on_2_done": cycle_buy_legs >= 3 if running_qty > 0 else False,
+        }
+
+    def _load_position_exit_history(self, symbol: str) -> pd.DataFrame:
+        end_date = date.today().isoformat()
+        history_days = max(int(self.config.get("minervini_exit_history_days", 180)), 60)
+        start_date = (date.today() - timedelta(days=history_days)).isoformat()
+        db_path = self.config.get("minervini_db_path", "research_data/market_data.duckdb")
+
+        def _read_frame(read_only: bool) -> pd.DataFrame:
+            warehouse = MarketDataWarehouse(db_path, read_only=read_only)
+            try:
+                return warehouse.get_daily_bars(symbol, start_date, end_date)
+            finally:
+                warehouse.close()
+
+        try:
+            frame = _read_frame(read_only=True)
+        except Exception:
+            frame = pd.DataFrame()
+
+        stale = frame.empty
+        if not frame.empty:
+            freshest = frame.index[-1].date()
+            stale = (date.today() - freshest).days > 5
+
+        if stale:
+            try:
+                warehouse = MarketDataWarehouse(db_path)
+                try:
+                    warehouse.fetch_and_store_daily_bars([symbol], start_date, end_date)
+                    frame = warehouse.get_daily_bars(symbol, start_date, end_date)
+                finally:
+                    warehouse.close()
+            except Exception as exc:
+                logger.warning("Could not refresh exit history for %s: %s", symbol, exc)
+
+        return frame
 
     def _trade_rule_based_setup(
         self,
@@ -1153,6 +1967,14 @@ class Orchestrator:
         except Exception as e:
             logger.error("Minervini preflight failed during snapshot: %s", e, exc_info=True)
         snapshot = self.tracker.take_daily_snapshot()
+        if self.config.get("minervini_live_exit_enabled", True):
+            try:
+                for position in self._stock_positions(self.broker.get_positions()):
+                    state = self._build_minervini_position_state(position)
+                    if state is not None:
+                        self._sync_minervini_protective_stop(position, state)
+            except Exception as exc:
+                logger.warning("Protective-stop sync during snapshot failed: %s", exc, exc_info=True)
         self._notify_morning_scan(preflight, snapshot)
         return snapshot
 
@@ -1251,17 +2073,8 @@ class Orchestrator:
             return score is not None and score >= 6
         return bool(context.get("confirmed_uptrend", False))
 
-    def _get_overlay_context(self) -> Optional[Dict]:
-        if not self._overlay_enabled():
-            return None
-
+    def _build_market_context_snapshot(self) -> Optional[Dict]:
         today = date.today().isoformat()
-        if (
-            self._latest_overlay_context is not None
-            and self._latest_overlay_context.get("computed_on") == today
-        ):
-            return self._latest_overlay_context
-
         lookback_days = max(int(self.config.get("minervini_lookback_days", 730)), 400)
         start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         end_date = today
@@ -1288,7 +2101,11 @@ class Orchestrator:
                 needs_refresh = len(latest_dates) != len(symbols)
                 if not needs_refresh and latest_dates:
                     freshest = max(latest_dates)
-                    needs_refresh = (date.today() - freshest).days > 5
+                    stalest = min(latest_dates)
+                    needs_refresh = (
+                        (date.today() - freshest).days > 5
+                        or (freshest - stalest).days > 3
+                    )
                 if needs_refresh:
                     warehouse.fetch_and_store_daily_bars(symbols, start_date, end_date)
                     frames = {
@@ -1303,15 +2120,16 @@ class Orchestrator:
                 latest = context_df.iloc[-1]
                 score = self._to_float(latest.get("market_score"))
                 context = {
-                    "symbol": self._overlay_symbol(),
                     "trade_date": context_df.index[-1].date().isoformat(),
                     "market_score": int(score) if score is not None else None,
                     "market_regime": str(latest["market_regime"]),
                     "confirmed_uptrend": bool(latest["market_confirmed_uptrend"]),
+                    "qqq_extension_pct": self._to_float(latest.get("qqq_extension_pct")),
+                    "qqq_roc_5": self._to_float(latest.get("qqq_roc_5")),
                     "source": "market_context",
                 }
         except Exception as exc:
-            logger.warning("Overlay context refresh failed: %s", exc)
+            logger.warning("Market context refresh failed: %s", exc)
 
         if context is None:
             fallback_regime = (
@@ -1320,7 +2138,6 @@ class Orchestrator:
                 else "unknown"
             )
             context = {
-                "symbol": self._overlay_symbol(),
                 "trade_date": today,
                 "market_score": None,
                 "market_regime": fallback_regime,
@@ -1329,11 +2146,68 @@ class Orchestrator:
                     if self._latest_minervini_preflight is not None
                     else False
                 ),
+                "qqq_extension_pct": None,
+                "qqq_roc_5": None,
                 "source": "preflight_fallback",
             }
 
-        context["overlay_allowed"] = self._overlay_context_allows_entry(context)
         context["computed_on"] = today
+        return context
+
+    def _get_market_context(self) -> Optional[Dict]:
+        today = date.today().isoformat()
+        if (
+            self._latest_market_context is not None
+            and self._latest_market_context.get("computed_on") == today
+        ):
+            return self._latest_market_context
+        context = self._build_market_context_snapshot()
+        self._latest_market_context = context
+        return context
+
+    def _market_extended_for_add_on(self, context: Optional[Dict]) -> bool:
+        if not self.config.get("market_extension_filter_enabled", True):
+            return False
+        if not context:
+            return False
+        extension_pct = self._to_float(context.get("qqq_extension_pct"))
+        roc_5 = self._to_float(context.get("qqq_roc_5"))
+        max_extension = float(self.config.get("market_extension_max_qqq_above_ema21_pct", 0.05))
+        max_roc_5 = float(self.config.get("market_extension_max_qqq_roc_5", 0.05))
+        extension_hot = extension_pct is not None and extension_pct >= max_extension
+        momentum_hot = roc_5 is not None and roc_5 >= max_roc_5
+        if extension_pct is not None and roc_5 is not None:
+            return extension_hot and momentum_hot
+        if extension_pct is not None:
+            return extension_hot
+        if roc_5 is not None:
+            return momentum_hot
+        return False
+
+    def _get_overlay_context(self) -> Optional[Dict]:
+        if not self._overlay_enabled():
+            return None
+
+        today = date.today().isoformat()
+        if (
+            self._latest_overlay_context is not None
+            and self._latest_overlay_context.get("computed_on") == today
+        ):
+            return self._latest_overlay_context
+
+        context = self._get_market_context() or {
+            "trade_date": today,
+            "market_score": None,
+            "market_regime": "unknown",
+            "confirmed_uptrend": False,
+            "qqq_extension_pct": None,
+            "qqq_roc_5": None,
+            "source": "empty",
+            "computed_on": today,
+        }
+        context = dict(context)
+        context["symbol"] = self._overlay_symbol()
+        context["overlay_allowed"] = self._overlay_context_allows_entry(context)
         self._latest_overlay_context = context
         return context
 
@@ -1404,6 +2278,20 @@ class Orchestrator:
             context=self._get_overlay_context(),
         )
 
+    def _overlay_step_aside_executed_today(self) -> bool:
+        if not self._overlay_enabled():
+            return False
+        overlay_symbol = self._overlay_symbol()
+        for trade in self.db.get_today_trades():
+            if str(trade.get("symbol") or "").upper() != overlay_symbol:
+                continue
+            if str(trade.get("side") or "").lower() != "sell":
+                continue
+            reasoning = str(trade.get("reasoning") or "")
+            if "Releasing overlay capital for actionable stock setups" in reasoning:
+                return True
+        return False
+
     def _manage_overlay_position(
         self,
         account: Account,
@@ -1447,6 +2335,13 @@ class Orchestrator:
             )
 
         if overlay_position is None and desired_overlay_notional < min_notional:
+            return None
+
+        if (
+            overlay_position is None
+            and desired_overlay_notional >= min_notional
+            and self._overlay_step_aside_executed_today()
+        ):
             return None
 
         delta_notional = desired_overlay_notional - current_overlay_notional
@@ -1732,23 +2627,171 @@ class Orchestrator:
         return None
 
     def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
+        orders = self._get_open_orders(symbol, side)
+        return orders[0] if orders else None
+
+    def _get_latest_setup_for_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if (
+            self._latest_minervini_preflight is not None
+            and self._latest_minervini_preflight.screen_df is not None
+            and not self._latest_minervini_preflight.screen_df.empty
+        ):
+            matches = self._latest_minervini_preflight.screen_df[
+                self._latest_minervini_preflight.screen_df["symbol"] == symbol
+            ]
+            if not matches.empty:
+                return matches.iloc[-1].to_dict()
+
+        for row in self.db.get_latest_setup_candidates():
+            if str(row.get("symbol") or "").upper() != symbol.upper():
+                continue
+            payload = row.get("payload_json")
+            if payload:
+                try:
+                    return json.loads(payload)
+                except Exception:
+                    pass
+            return row
+        return None
+
+    def _load_position_management_state(
+        self, symbol: str, state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        inferred = self._infer_position_management_from_trades(symbol)
+        inferred_cycle_entry = inferred.get("cycle_entry_date")
+        cycle_entry_date = str(
+            inferred_cycle_entry.isoformat()
+            if inferred_cycle_entry is not None
+            else state.get("entry_trade_date") or ""
+        )
+        row = self.db.get_position_management_state(symbol) or {}
+        if row.get("cycle_entry_date") and row.get("cycle_entry_date") != cycle_entry_date:
+            row = {}
+        return {
+            "cycle_entry_date": cycle_entry_date,
+            "partial_profit_taken": bool(row.get("partial_profit_taken", False))
+            or bool(inferred.get("partial_profit_taken", False)),
+            "add_on_1_done": bool(row.get("add_on_1_done", False))
+            or bool(inferred.get("add_on_1_done", False)),
+            "add_on_2_done": bool(row.get("add_on_2_done", False))
+            or bool(inferred.get("add_on_2_done", False)),
+        }
+
+    def _persist_position_management_state(
+        self, symbol: str, state: Dict[str, Any]
+    ) -> None:
+        self.db.upsert_position_management_state(
+            symbol=symbol,
+            cycle_entry_date=state.get("cycle_entry_date"),
+            partial_profit_taken=bool(state.get("partial_profit_taken")),
+            add_on_1_done=bool(state.get("add_on_1_done")),
+            add_on_2_done=bool(state.get("add_on_2_done")),
+        )
+
+    def _setup_supports_pyramiding(
+        self,
+        setup: Optional[Dict[str, Any]],
+        current_price: Optional[float],
+    ) -> bool:
+        if not setup:
+            return False
+
+        candidate_status = str(setup.get("candidate_status") or "")
+        if candidate_status not in {
+            "leader_continuation_watch",
+            "leader_continuation_actionable",
+            "near_pivot",
+            "breakout_ready",
+        } and not bool(setup.get("breakout_signal")):
+            return False
+
+        buy_limit_price = self._to_float(setup.get("buy_limit_price"))
+        if (
+            current_price is not None
+            and buy_limit_price is not None
+            and current_price > buy_limit_price
+        ):
+            return False
+
+        close_range_pct = self._to_float(setup.get("close_range_pct"))
+        min_close_range_pct = float(
+            self.config.get("leader_continuation_min_close_range_pct", 0.15)
+        )
+        if close_range_pct is not None and close_range_pct < min_close_range_pct:
+            return False
+
+        return (
+            bool(setup.get("breakout_ready"))
+            or bool(setup.get("breakout_signal"))
+            or self._is_leader_continuation_setup(setup)
+        )
+
+    def _calculate_add_on_qty(
+        self,
+        *,
+        account: Account,
+        positions: List[Position],
+        position: Position,
+        price: float,
+        stop_price: float,
+        add_fraction: float,
+    ) -> int:
+        risk_per_share = max(price - stop_price, 0.0)
+        if risk_per_share <= 0:
+            return 0
+
+        equity = float(account.equity or 0.0)
+        if equity <= 0:
+            return 0
+
+        max_position_value = equity * float(self.config.get("max_position_pct", 0.12))
+        current_value = float(position.market_value or 0.0)
+        remaining_capacity = max(0.0, max_position_value - current_value)
+        if remaining_capacity <= 0:
+            return 0
+
+        current_exposure_value = sum(float(p.market_value or 0.0) for p in positions)
+        max_total_exposure_value = equity * float(self.config.get("max_total_exposure", 0.72))
+        remaining_exposure_capacity = max(0.0, max_total_exposure_value - current_exposure_value)
+        if remaining_exposure_capacity <= 0:
+            return 0
+
+        min_cash_reserve = equity * float(self.config.get("min_cash_reserve", 0.20))
+        spendable_cash = max(0.0, float(account.cash or 0.0) - min_cash_reserve)
+        if spendable_cash <= 0:
+            return 0
+
+        target_value = min(
+            max_position_value * add_fraction,
+            remaining_capacity,
+            remaining_exposure_capacity,
+            spendable_cash,
+        )
+        risk_budget = equity * float(self.config.get("risk_per_trade", 0.012)) * add_fraction
+
+        qty_by_value = int(target_value / price)
+        qty_by_risk = int(risk_budget / risk_per_share)
+        return max(0, min(qty_by_value, qty_by_risk))
+
+    def _get_open_orders(self, symbol: str, side: Optional[str] = None):
         getter = getattr(self.broker, "get_open_orders", None)
         if not callable(getter):
-            return None
+            return []
         try:
             orders = getter(symbol=symbol)
         except TypeError:
             orders = getter()
         except Exception as exc:
             logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
-            return None
+            return []
 
         target_symbol = symbol.upper()
         target_side = side.lower() if side else None
         terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        matches = []
         for order in orders or []:
             order_symbol = str(getattr(order, "symbol", "") or "").upper()
-            order_side = str(getattr(order, "side", "") or "").lower()
+            order_side = self._enum_name(getattr(order, "side", ""))
             order_status = str(getattr(order, "status", "") or "").lower()
             if order_symbol != target_symbol:
                 continue
@@ -1756,8 +2799,21 @@ class Orchestrator:
                 continue
             if order_status in terminal_statuses:
                 continue
-            return order
-        return None
+            matches.append(order)
+        return matches
+
+    def _cancel_open_orders(self, symbol: str, side: Optional[str] = None) -> List[str]:
+        canceled: List[str] = []
+        for order in self._get_open_orders(symbol, side):
+            order_id = str(getattr(order, "order_id", "") or "")
+            if not order_id:
+                continue
+            try:
+                self.broker.cancel_order(order_id)
+                canceled.append(order_id)
+            except Exception as exc:
+                logger.warning("Could not cancel order %s for %s: %s", order_id, symbol, exc)
+        return canceled
 
     def _target_exposure_for_regime(self, regime: Optional[str]) -> float:
         regime = (regime or "").lower()
@@ -1849,3 +2905,14 @@ class Orchestrator:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _enum_name(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if "." in text:
+            text = text.split(".")[-1]
+        return text
+
+    @classmethod
+    def _order_type_name(cls, value: Any) -> str:
+        return cls._enum_name(value)

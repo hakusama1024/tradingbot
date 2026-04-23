@@ -101,9 +101,66 @@ def build_config(overrides: dict = None) -> dict:
         "minervini_use_close_range_filter": True,
         "minervini_min_close_range_pct": 0.55,
         "minervini_allow_new_entries_in_correction": False,
-        "minervini_target_exposure_confirmed_uptrend": 0.72,
-        "minervini_target_exposure_uptrend_under_pressure": 0.48,
-        "minervini_target_exposure_market_correction": 0.0,
+        "minervini_target_exposure_confirmed_uptrend": float(
+            os.getenv("MINERVINI_TARGET_EXPOSURE_CONFIRMED_UPTREND", "0.72")
+        ),
+        "minervini_target_exposure_uptrend_under_pressure": float(
+            os.getenv("MINERVINI_TARGET_EXPOSURE_UPTREND_UNDER_PRESSURE", "0.48")
+        ),
+        "minervini_target_exposure_market_correction": float(
+            os.getenv("MINERVINI_TARGET_EXPOSURE_MARKET_CORRECTION", "0.0")
+        ),
+        "minervini_live_exit_enabled": _env_flag("MINERVINI_LIVE_EXIT_ENABLED", True),
+        "minervini_use_stop_only_entries": _env_flag("MINERVINI_USE_STOP_ONLY_ENTRIES", True),
+        "minervini_breakeven_trigger_pct": float(
+            os.getenv("MINERVINI_BREAKEVEN_TRIGGER_PCT", "0.08")
+        ),
+        "minervini_breakeven_buffer_pct": float(
+            os.getenv("MINERVINI_BREAKEVEN_BUFFER_PCT", "0.003")
+        ),
+        "minervini_trailing_lock_trigger_pct_1": float(
+            os.getenv("MINERVINI_TRAILING_LOCK_TRIGGER_PCT_1", "0.12")
+        ),
+        "minervini_trailing_lock_floor_pct_1": float(
+            os.getenv("MINERVINI_TRAILING_LOCK_FLOOR_PCT_1", "0.03")
+        ),
+        "minervini_trailing_lock_trigger_pct_2": float(
+            os.getenv("MINERVINI_TRAILING_LOCK_TRIGGER_PCT_2", "0.20")
+        ),
+        "minervini_trailing_lock_floor_pct_2": float(
+            os.getenv("MINERVINI_TRAILING_LOCK_FLOOR_PCT_2", "0.08")
+        ),
+        "minervini_ema21_profit_floor_pct": float(
+            os.getenv("MINERVINI_EMA21_PROFIT_FLOOR_PCT", "0.10")
+        ),
+        "minervini_ema21_break_buffer_pct": float(
+            os.getenv("MINERVINI_EMA21_BREAK_BUFFER_PCT", "0.0025")
+        ),
+        "minervini_partial_profit_enabled": _env_flag(
+            "MINERVINI_PARTIAL_PROFIT_ENABLED", True
+        ),
+        "minervini_partial_profit_trigger_pct": float(
+            os.getenv("MINERVINI_PARTIAL_PROFIT_TRIGGER_PCT", "0.12")
+        ),
+        "minervini_partial_profit_fraction": float(
+            os.getenv("MINERVINI_PARTIAL_PROFIT_FRACTION", "0.33")
+        ),
+        "minervini_add_on_enabled": _env_flag("MINERVINI_ADD_ON_ENABLED", True),
+        "minervini_add_on_trigger_pct_1": float(
+            os.getenv("MINERVINI_ADD_ON_TRIGGER_PCT_1", "0.025")
+        ),
+        "minervini_add_on_trigger_pct_2": float(
+            os.getenv("MINERVINI_ADD_ON_TRIGGER_PCT_2", "0.05")
+        ),
+        "minervini_add_on_fraction_1": float(
+            os.getenv("MINERVINI_ADD_ON_FRACTION_1", "0.30")
+        ),
+        "minervini_add_on_fraction_2": float(
+            os.getenv("MINERVINI_ADD_ON_FRACTION_2", "0.20")
+        ),
+        "minervini_exit_history_days": int(
+            os.getenv("MINERVINI_EXIT_HISTORY_DAYS", "180")
+        ),
         "leader_continuation_enabled": _env_flag("LEADER_CONTINUATION_ENABLED", True),
         "leader_continuation_min_rs_percentile": float(
             os.getenv("LEADER_CONTINUATION_MIN_RS_PERCENTILE", "75")
@@ -141,6 +198,13 @@ def build_config(overrides: dict = None) -> dict:
         ),
         "leader_continuation_stop_loss_pct": float(
             os.getenv("LEADER_CONTINUATION_STOP_LOSS_PCT", "0.06")
+        ),
+        "market_extension_filter_enabled": _env_flag("MARKET_EXTENSION_FILTER_ENABLED", True),
+        "market_extension_max_qqq_above_ema21_pct": float(
+            os.getenv("MARKET_EXTENSION_MAX_QQQ_ABOVE_EMA21_PCT", "0.05")
+        ),
+        "market_extension_max_qqq_roc_5": float(
+            os.getenv("MARKET_EXTENSION_MAX_QQQ_ROC_5", "0.05")
         ),
 
         # Portable-alpha overlay
@@ -205,13 +269,13 @@ def build_config(overrides: dict = None) -> dict:
 
         # Position sizing
         "max_position_pct": 0.12,
-        "max_total_exposure": 0.72,
+        "max_total_exposure": float(os.getenv("MAX_TOTAL_EXPOSURE", "0.72")),
         "risk_per_trade": 0.012,
 
         # Risk controls
         "max_daily_loss": 0.03,
         "max_drawdown": 0.10,
-        "min_cash_reserve": 0.20,
+        "min_cash_reserve": float(os.getenv("MIN_CASH_RESERVE", "0.20")),
         "max_open_positions": int(os.getenv("MAX_OPEN_POSITIONS", "6")),
         "default_stop_loss_pct": 0.08,
         "default_take_profit_pct": 0.15,

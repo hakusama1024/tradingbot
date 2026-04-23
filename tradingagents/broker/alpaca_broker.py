@@ -139,35 +139,43 @@ class AlpacaBroker(BaseBroker):
         self,
         order: OrderRequest,
         stop_loss_price: float,
-        take_profit_price: float,
+        take_profit_price: Optional[float] = None,
     ) -> OrderResult:
-        """Submit a bracket order: main entry + automatic stop-loss + take-profit.
+        """Submit a protected entry order.
 
-        When the main order fills, Alpaca automatically creates:
-        - A stop order at stop_loss_price (sells if price drops)
-        - A limit order at take_profit_price (sells if price rises)
-        Whichever triggers first cancels the other (OCO).
+        If take_profit_price is provided, use a bracket order:
+        - A stop order at stop_loss_price
+        - A limit order at take_profit_price
+
+        If take_profit_price is omitted, use an OTO order with stop-loss only.
         """
         if order.side != "buy":
             return self.submit_order(order)
 
-        tif = TIF_MAP.get(order.time_in_force, TimeInForce.DAY)
-
-        req = MarketOrderRequest(
-            symbol=order.symbol,
-            side=OrderSide.BUY,
-            qty=order.qty,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            stop_loss={"stop_price": round(stop_loss_price, 2)},
-            take_profit={"limit_price": round(take_profit_price, 2)},
-        )
+        order_class = OrderClass.BRACKET if take_profit_price is not None else OrderClass.OTO
+        req_kwargs = {
+            "symbol": order.symbol,
+            "side": OrderSide.BUY,
+            "qty": order.qty,
+            "time_in_force": TimeInForce.GTC,
+            "order_class": order_class,
+            "stop_loss": {"stop_price": round(stop_loss_price, 2)},
+        }
+        if take_profit_price is not None:
+            req_kwargs["take_profit"] = {"limit_price": round(take_profit_price, 2)}
+        req = MarketOrderRequest(**req_kwargs)
 
         result = self.trading_client.submit_order(req)
-        logger.info(
-            f"Bracket order: BUY {order.qty} {order.symbol} "
-            f"SL=${stop_loss_price:.2f} TP=${take_profit_price:.2f} -> {result.status}"
-        )
+        if take_profit_price is not None:
+            logger.info(
+                f"Bracket order: BUY {order.qty} {order.symbol} "
+                f"SL=${stop_loss_price:.2f} TP=${take_profit_price:.2f} -> {result.status}"
+            )
+        else:
+            logger.info(
+                f"OTO order: BUY {order.qty} {order.symbol} "
+                f"SL=${stop_loss_price:.2f} -> {result.status}"
+            )
         return self._to_order_result(result)
 
     def cancel_order(self, order_id: str) -> None:
@@ -195,6 +203,8 @@ class AlpacaBroker(BaseBroker):
             status=str(o.status),
             filled_qty=float(o.filled_qty or 0),
             filled_avg_price=float(o.filled_avg_price) if o.filled_avg_price else None,
+            limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
+            stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
             submitted_at=o.submitted_at,
             filled_at=o.filled_at,
         )

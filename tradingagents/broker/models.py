@@ -29,6 +29,8 @@ class OrderResult:
     status: str
     filled_qty: float = 0.0
     filled_avg_price: Optional[float] = None
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
     submitted_at: Optional[datetime] = None
     filled_at: Optional[datetime] = None
 
