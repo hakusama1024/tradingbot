@@ -33,6 +33,8 @@ def install_launch_agent(
     mode: str = "swing",
     symbols: Optional[list[str]] = None,
     label: str = DEFAULT_LABEL,
+    environment_variables: Optional[dict[str, str]] = None,
+    log_dir: Optional[str] = None,
 ) -> Path:
     repo_path = Path(repo_root).resolve()
     # Preserve the venv entrypoint path. Resolving it can collapse the symlink
@@ -40,8 +42,8 @@ def install_launch_agent(
     python_path = Path(python_bin)
     plist_path = _launch_agent_path(label)
 
-    log_dir = repo_path / "results" / "service_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    resolved_log_dir = Path(log_dir).resolve() if log_dir else (repo_path / "results" / "service_logs")
+    resolved_log_dir.mkdir(parents=True, exist_ok=True)
 
     program_args = [
         str(python_path),
@@ -60,13 +62,15 @@ def install_launch_agent(
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Background",
-        "StandardOutPath": str(log_dir / "automation_service.out.log"),
-        "StandardErrorPath": str(log_dir / "automation_service.err.log"),
+        "StandardOutPath": str(resolved_log_dir / "automation_service.out.log"),
+        "StandardErrorPath": str(resolved_log_dir / "automation_service.err.log"),
         "EnvironmentVariables": {
             "PATH": os.environ.get("PATH", ""),
             "PYTHONUNBUFFERED": "1",
         },
     }
+    if environment_variables:
+        plist["EnvironmentVariables"].update(environment_variables)
 
     plist_path.parent.mkdir(parents=True, exist_ok=True)
 

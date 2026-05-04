@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from email.header import Header
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib import parse, request
@@ -54,13 +55,13 @@ class NtfyNotifier:
             final_tags.extend(str(tag).strip() for tag in tags if str(tag).strip())
 
         headers = {
-            "Title": title,
-            "Priority": str(priority or self.default_priority),
+            "Title": self._encode_header_value(title),
+            "Priority": self._encode_header_value(str(priority or self.default_priority)),
         }
         if final_tags:
-            headers["Tags"] = ",".join(dict.fromkeys(final_tags))
+            headers["Tags"] = self._encode_header_value(",".join(dict.fromkeys(final_tags)))
         if click or self.click_url:
-            headers["Click"] = click or self.click_url
+            headers["Click"] = self._encode_header_value(click or self.click_url)
 
         publish_url = f"{self.server}/{parse.quote(self.topic, safe='')}"
         payload = message.encode("utf-8")
@@ -80,6 +81,13 @@ class NtfyNotifier:
         except Exception as exc:
             logger.warning("Failed to send ntfy notification: %s", exc)
             return False
+
+    def _encode_header_value(self, value: str) -> str:
+        try:
+            value.encode("latin-1")
+            return value
+        except UnicodeEncodeError:
+            return Header(value, "utf-8").encode()
 
     def _already_sent(self, key: str) -> bool:
         state = self._load_state()

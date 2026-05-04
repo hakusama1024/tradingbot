@@ -34,19 +34,23 @@ class Orchestrator:
 
     def __init__(self, config: dict):
         self.config = config
+        self.execution_enabled = bool(config.get("execution_enabled", True))
         self.watchlist = config.get("watchlist", [])
         self._latest_analysis_states: Dict[str, Dict] = {}
         self._latest_minervini_preflight = None
         self._active_universe: list[str] = list(self.watchlist)
         self._latest_overlay_context: Optional[Dict] = None
         self._latest_market_context: Optional[Dict] = None
+        self._latest_earnings_context: Dict[str, Dict[str, Any]] = {}
 
         # Broker
-        self.broker = AlpacaBroker(
-            api_key=config["alpaca_api_key"],
-            secret_key=config["alpaca_secret_key"],
-            paper=config.get("paper_trading", True),
-        )
+        self.broker = None
+        if self.execution_enabled:
+            self.broker = AlpacaBroker(
+                api_key=config["alpaca_api_key"],
+                secret_key=config["alpaca_secret_key"],
+                paper=config.get("paper_trading", True),
+            )
 
         # Database
         self.db = TradingDatabase(config.get("db_path", "trading.db"))
@@ -61,7 +65,11 @@ class Orchestrator:
         self.sizer = PositionSizer(config)
 
         # Portfolio tracker
-        self.tracker = PortfolioTracker(self.broker, self.db)
+        self.tracker = (
+            PortfolioTracker(self.broker, self.db, self.config)
+            if self.broker is not None
+            else None
+        )
 
         # AI analysis engine (lazy init to avoid heavy startup cost)
         self._ta: Optional[TradingAgentsGraph] = None
@@ -255,6 +263,11 @@ class Orchestrator:
             ascending=[False, True],
             na_position="last",
         ).head(top_n)
+        canslim_selected = (
+            screen_df[screen_df["canslim_selected"].fillna(False).astype(bool)]
+            if "canslim_selected" in screen_df.columns
+            else screen_df.iloc[0:0]
+        )
 
         lines = [
             f"Date: {preflight.trade_date}",
@@ -262,6 +275,14 @@ class Orchestrator:
             f"Approved: {len(preflight.approved_symbols)}",
             f"Watch: {len(watch)}",
         ]
+        if "canslim_selected" in screen_df.columns:
+            lines.extend(
+                [
+                    f"CAN SLIM通过: {len(canslim_selected)}",
+                    f"Minervini观察: {len(watch)}",
+                    f"最终可下单: {len(actionable)}",
+                ]
+            )
         if snapshot is not None:
             daily_pl = self._to_float(snapshot.get("daily_pl"))
             if daily_pl is not None:
@@ -278,6 +299,18 @@ class Orchestrator:
             )
         else:
             lines.append("No approved or watch candidates this morning.")
+
+        if "canslim_selected" in screen_df.columns and not canslim_selected.empty:
+            lines.append(
+                "CAN SLIM名单: " + ", ".join(canslim_selected["symbol"].head(top_n).tolist())
+            )
+        if not actionable.empty:
+            lines.append(
+                "可下单名单: " + ", ".join(actionable["symbol"].head(top_n).tolist())
+            )
+
+        rotation_lines = self._build_rotation_summary_lines(screen_df, top_n=top_n)
+        lines.extend(rotation_lines)
 
         if not ranked.empty:
             lines.append("Top names:")
@@ -301,6 +334,130 @@ class Orchestrator:
             dedupe_key=f"morning-scan:{preflight.trade_date}",
         )
 
+    def _build_rotation_summary_lines(
+        self, screen_df: pd.DataFrame, top_n: int = 5
+    ) -> list[str]:
+        if (
+            not self.config.get("ntfy_morning_scan_rotation_enabled", True)
+            or screen_df is None
+            or screen_df.empty
+        ):
+            return []
+
+        focus_mask = pd.Series(False, index=screen_df.index)
+        for column in (
+            "rule_entry_candidate",
+            "rule_watch_candidate",
+            "selected_for_analysis",
+            "passed_template",
+        ):
+            if column in screen_df.columns:
+                focus_mask = focus_mask | screen_df[column].fillna(False).astype(bool)
+
+        focus_df = screen_df[focus_mask].copy()
+        if focus_df.empty:
+            sort_cols = [
+                col
+                for col in ("rs_percentile", "distance_to_buy_point_pct")
+                if col in screen_df.columns
+            ]
+            if sort_cols:
+                ascending = [False, True][: len(sort_cols)]
+                focus_df = screen_df.sort_values(
+                    by=sort_cols,
+                    ascending=ascending,
+                    na_position="last",
+                ).head(max(top_n * 4, 12)).copy()
+            else:
+                focus_df = screen_df.head(max(top_n * 4, 12)).copy()
+
+        sector_summary = self._summarize_rotation_groups(
+            focus_df,
+            group_field="sector",
+            top_groups=int(self.config.get("ntfy_morning_scan_rotation_top_groups", 3)),
+        )
+        industry_summary = self._summarize_rotation_groups(
+            focus_df,
+            group_field="industry",
+            top_groups=int(self.config.get("ntfy_morning_scan_rotation_top_groups", 3)),
+        )
+
+        focus_groups = []
+        if industry_summary:
+            focus_groups = [entry["name"] for entry in industry_summary[:2]]
+        elif sector_summary:
+            focus_groups = [entry["name"] for entry in sector_summary[:2]]
+
+        lines: list[str] = []
+        if sector_summary:
+            lines.append(
+                "板块轮动："
+                + "; ".join(
+                    f"{entry['name']} x{entry['count']}"
+                    for entry in sector_summary
+                )
+            )
+        if industry_summary:
+            lines.append(
+                "行业组："
+                + "; ".join(
+                    f"{entry['name']} x{entry['count']} ({entry['symbols']})"
+                    for entry in industry_summary
+                )
+            )
+        if focus_groups:
+            lines.append("重点关注：" + ", ".join(focus_groups))
+        return lines
+
+    def _summarize_rotation_groups(
+        self,
+        screen_df: pd.DataFrame,
+        group_field: str,
+        top_groups: int = 3,
+    ) -> list[Dict[str, Any]]:
+        if group_field not in screen_df.columns or screen_df.empty:
+            return []
+
+        valid = screen_df.copy()
+        valid[group_field] = (
+            valid[group_field]
+            .fillna("Unknown")
+            .astype(str)
+            .str.strip()
+            .replace({"": "Unknown"})
+        )
+        if "symbol" not in valid.columns:
+            return []
+
+        summaries: list[Dict[str, Any]] = []
+        for name, group in valid.groupby(group_field):
+            rank_cols = [
+                col
+                for col in ("rule_entry_candidate", "rs_percentile")
+                if col in group.columns
+            ]
+            if rank_cols:
+                ranked = group.sort_values(
+                    by=rank_cols,
+                    ascending=[False, False][: len(rank_cols)],
+                    na_position="last",
+                )
+            else:
+                ranked = group
+            symbols = ", ".join(ranked["symbol"].astype(str).head(3).tolist())
+            avg_rs = self._to_float(group.get("rs_percentile", pd.Series(dtype=float)).mean())
+            summaries.append(
+                {
+                    "name": name,
+                    "count": int(len(group)),
+                    "avg_rs": avg_rs if avg_rs is not None else -999.0,
+                    "symbols": symbols,
+                }
+            )
+
+        summaries.sort(key=lambda item: (-item["count"], -item["avg_rs"], item["name"]))
+        return summaries[: max(top_groups, 1)]
+
     def _notify_daily_summary(self, report: Dict):
         if (
             not self.notifier.enabled
@@ -313,6 +470,9 @@ class Orchestrator:
         screening_batch = report.get("screening_batch", {}) or {}
         position_summary = report.get("position_summary", {}) or {}
         account = report.get("account", {}) or {}
+        attribution = report.get("attribution", {}) or {}
+        benchmark_window = attribution.get("benchmark_window", {}) or {}
+        snapshot_attr = attribution.get("snapshot_attribution", {}) or {}
 
         symbols = trade_summary.get("symbols") or []
         lines = [
@@ -325,6 +485,21 @@ class Orchestrator:
             f"Open positions: {position_summary.get('open_positions', 0)}",
             f"Open unrealized P/L: ${float(position_summary.get('total_unrealized_pl', 0.0)):,.2f}",
         ]
+        benchmarks = benchmark_window.get("benchmarks", {}) or {}
+        if benchmark_window.get("strategy_return") is not None and benchmarks:
+            strategy_return = float(benchmark_window.get("strategy_return", 0.0))
+            comp_parts = [f"1M Strategy {strategy_return:.1%}"]
+            for symbol in ("SPY", "QQQ", "SMH"):
+                if symbol in benchmarks:
+                    comp_parts.append(f"{symbol} {float(benchmarks[symbol]):.1%}")
+            lines.append(" | ".join(comp_parts))
+        if snapshot_attr.get("available"):
+            lines.append(
+                "Attribution: "
+                f"Overlay {float(snapshot_attr.get('overlay_return_equiv', 0.0)):.1%} | "
+                f"Beta {float(snapshot_attr.get('beta_return_equiv', 0.0)):.1%} | "
+                f"Selection {float(snapshot_attr.get('selection_return_equiv', 0.0)):.1%}"
+            )
         if symbols:
             lines.append("Symbols traded: " + ", ".join(symbols))
         else:
@@ -503,6 +678,14 @@ class Orchestrator:
                 "total_unrealized_pl": total_unrealized_pl,
             },
             "performance": self.tracker.get_performance_summary(),
+            "attribution": {
+                "available": False,
+                "benchmark_window": {},
+                "snapshot_attribution": {
+                    "available": False,
+                    "reason": "Fallback report",
+                },
+            },
             "paper_mode": self.config.get("paper_trading", True),
             "watchlist": self.watchlist,
             "fallback_used": True,
@@ -674,7 +857,7 @@ class Orchestrator:
         logger.info("=" * 60)
         self._latest_analysis_states = {}
 
-        if not self.broker.is_market_open():
+        if self.execution_enabled and self.broker is not None and not self.broker.is_market_open():
             logger.info("Market is closed. Skipping analysis.")
             return {"status": "market_closed"}
 
@@ -685,6 +868,49 @@ class Orchestrator:
         except Exception as e:
             preflight_error = str(e)
             logger.error("Minervini preflight failed: %s", e, exc_info=True)
+
+        if not self.execution_enabled or self.broker is None:
+            analysis_universe = [
+                symbol for symbol in self._analysis_universe(preflight)
+                if not self._is_overlay_symbol(symbol)
+            ]
+            self._active_universe = list(analysis_universe)
+            results = {}
+            if preflight_error:
+                for symbol in analysis_universe:
+                    results[symbol] = {
+                        "symbol": symbol,
+                        "action": "ALERT_ONLY",
+                        "traded": False,
+                        "screen_rejected": f"Minervini preflight failed: {preflight_error}",
+                    }
+                return results
+
+            setup_rows = {}
+            if preflight is not None and preflight.screen_df is not None and not preflight.screen_df.empty:
+                setup_rows = {
+                    row["symbol"]: row.to_dict()
+                    for _, row in preflight.screen_df.iterrows()
+                }
+                approved = set(preflight.approved_symbols)
+                for symbol in analysis_universe:
+                    if symbol in approved:
+                        row = setup_rows.get(symbol, {})
+                        results[symbol] = {
+                            "symbol": symbol,
+                            "action": "ALERT_ONLY",
+                            "traded": False,
+                            "candidate_status": row.get("candidate_status"),
+                            "buy_point": row.get("buy_point"),
+                            "buy_limit_price": row.get("buy_limit_price"),
+                            "market_regime": row.get("market_regime"),
+                            "screen_rejected": "Execution disabled for this profile; alert only",
+                        }
+                    else:
+                        results[symbol] = self._build_screen_rejection(symbol, preflight)
+            logger.info("Alerts-only analysis complete. Results: %s", list(results.keys()))
+            return results
+
         overlay_context = self._get_overlay_context()
         analysis_universe = [
             symbol for symbol in self._analysis_universe(preflight)
@@ -997,6 +1223,21 @@ class Orchestrator:
                     self.db.delete_position_management_state(position.symbol)
                 return exit_result
 
+            earnings_result = self._trade_minervini_earnings_risk(
+                position=position,
+                state=state,
+                management_state=management_state,
+            )
+            if earnings_result is not None:
+                if earnings_result.get("fully_closed"):
+                    self.db.delete_position_management_state(position.symbol)
+                    return earnings_result
+                if earnings_result.get("traded"):
+                    return earnings_result
+                self._persist_position_management_state(position.symbol, management_state)
+                self._sync_minervini_protective_stop(position, state)
+                return earnings_result
+
             deferred_reason = None
 
             partial_result = self._trade_minervini_partial_profit(
@@ -1103,6 +1344,268 @@ class Orchestrator:
             "order_id": order_result.order_id,
             "status": order_result.status,
             "rule_exit": exit_signal["trigger"],
+        }
+
+    def _trade_minervini_earnings_risk(
+        self,
+        *,
+        position: Position,
+        state: Dict[str, Any],
+        management_state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.config.get("minervini_earnings_management_enabled", True):
+            return None
+
+        earnings_context = self._get_position_earnings_context(position.symbol)
+        if not self._earnings_window_active(earnings_context):
+            return None
+
+        symbol = position.symbol
+        event_date = str(earnings_context.get("earnings_event_date") or "")
+        prior_event_date = str(management_state.get("earnings_event_date") or "")
+        prior_action = str(management_state.get("earnings_action") or "")
+        if event_date and prior_event_date == event_date and prior_action:
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    f"Earnings plan already applied for {event_date} ({prior_action})"
+                ),
+                "earnings_managed": True,
+            }
+
+        current_gain_pct = float(state.get("current_gain_pct") or 0.0)
+        flat_below_gain_pct = float(
+            self.config.get("minervini_earnings_flat_below_gain_pct", 0.05)
+        )
+        trim_below_gain_pct = float(
+            self.config.get("minervini_earnings_trim_below_gain_pct", 0.10)
+        )
+        trim_fraction = float(
+            self.config.get("minervini_earnings_trim_fraction", 0.50)
+        )
+        core_trim_fraction = float(
+            self.config.get("minervini_earnings_core_trim_fraction", 0.33)
+        )
+
+        total_qty = int(float(position.qty or 0))
+        days_away = self._to_float(earnings_context.get("earnings_days_away"))
+        days_label = (
+            f"{days_away:.1f} day(s)"
+            if days_away is not None
+            else "the next few days"
+        )
+
+        if current_gain_pct < flat_below_gain_pct or total_qty <= 1:
+            reason = (
+                f"Minervini earnings risk exit: {symbol} reports in {days_label} and only has "
+                f"a {current_gain_pct:.1%} profit cushion; exiting instead of carrying earnings risk."
+            )
+            signal_id = self.db.log_signal(
+                symbol=symbol,
+                action="SELL",
+                confidence=0.82,
+                reasoning=reason,
+                timeframe="swing",
+                full_analysis=json.dumps(
+                    {
+                        "symbol": symbol,
+                        "trigger": "earnings_flat",
+                        "earnings_context": earnings_context,
+                        "current_gain_pct": current_gain_pct,
+                    },
+                    default=str,
+                ),
+            )
+            try:
+                canceled = self._cancel_open_orders(symbol, side="sell")
+                if canceled:
+                    logger.info(
+                        "%s: canceled %s existing sell order(s) before earnings exit",
+                        symbol,
+                        len(canceled),
+                    )
+                order_result = self.broker.close_position(symbol)
+            except Exception as exc:
+                self.db.mark_signal_rejected(signal_id, str(exc))
+                logger.error(
+                    "Earnings-risk exit failed for %s: %s",
+                    symbol,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "symbol": symbol,
+                    "action": "SELL",
+                    "traded": False,
+                    "risk_rejected": str(exc),
+                }
+
+            self.db.log_trade(
+                symbol=symbol,
+                side="sell",
+                qty=float(position.qty),
+                order_type="market",
+                status=order_result.status,
+                filled_qty=order_result.filled_qty,
+                filled_price=order_result.filled_avg_price,
+                order_id=order_result.order_id,
+                signal_id=signal_id,
+                reasoning=reason,
+            )
+            self.db.mark_signal_executed(signal_id)
+            self._notify_order(
+                symbol=symbol,
+                side="sell",
+                qty=float(position.qty),
+                status=str(order_result.status),
+                order_id=order_result.order_id,
+                filled_price=order_result.filled_avg_price,
+                reasoning=reason,
+                source="minervini_earnings_flat",
+            )
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "traded": True,
+                "side": "sell",
+                "qty": float(position.qty),
+                "order_id": order_result.order_id,
+                "status": order_result.status,
+                "rule_exit": "earnings_flat",
+                "fully_closed": True,
+            }
+
+        trim_action = "earnings_trim"
+        sell_fraction = trim_fraction
+        if current_gain_pct >= trim_below_gain_pct:
+            trim_action = "earnings_hold_core"
+            sell_fraction = core_trim_fraction
+
+        sell_qty = min(total_qty - 1, max(1, int(total_qty * sell_fraction)))
+        if sell_qty <= 0:
+            management_state["earnings_event_date"] = event_date or None
+            management_state["earnings_action"] = "hold_core"
+            self._persist_position_management_state(symbol, management_state)
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": (
+                    f"Holding reduced core into earnings for {event_date or 'upcoming report'}"
+                ),
+                "earnings_managed": True,
+            }
+
+        if trim_action == "earnings_hold_core":
+            reason = (
+                f"Minervini earnings trim: {symbol} reports in {days_label} and already has "
+                f"a {current_gain_pct:.1%} cushion; trimming {sell_qty} shares to carry only a "
+                "reduced core position into the event."
+            )
+        else:
+            reason = (
+                f"Minervini earnings trim: {symbol} reports in {days_label} and only has "
+                f"a {current_gain_pct:.1%} cushion; cutting {sell_qty} shares ahead of the report."
+            )
+
+        open_sell_orders = self._get_open_orders(symbol, side="sell")
+        if open_sell_orders:
+            canceled = self._cancel_open_orders(symbol, side="sell")
+            wait_reason = (
+                f"Refreshing {len(canceled)} protective sell order(s) before earnings trim"
+                if canceled
+                else "Waiting for existing protective sell orders to clear before earnings trim"
+            )
+            return {
+                "symbol": symbol,
+                "action": "HOLD",
+                "traded": False,
+                "screen_rejected": wait_reason,
+                "earnings_managed": True,
+            }
+
+        signal_id = self.db.log_signal(
+            symbol=symbol,
+            action="SELL",
+            confidence=0.8,
+            reasoning=reason,
+            timeframe="swing",
+            full_analysis=json.dumps(
+                {
+                    "symbol": symbol,
+                    "trigger": trim_action,
+                    "earnings_context": earnings_context,
+                    "current_gain_pct": current_gain_pct,
+                    "sell_qty": sell_qty,
+                },
+                default=str,
+            ),
+        )
+
+        try:
+            order_result = self.broker.submit_order(
+                OrderRequest(
+                    symbol=symbol,
+                    side="sell",
+                    qty=float(sell_qty),
+                    order_type="market",
+                )
+            )
+        except Exception as exc:
+            self.db.mark_signal_rejected(signal_id, str(exc))
+            logger.error(
+                "Earnings-risk trim failed for %s: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "traded": False,
+                "risk_rejected": str(exc),
+            }
+
+        self.db.log_trade(
+            symbol=symbol,
+            side="sell",
+            qty=float(sell_qty),
+            order_type="market",
+            status=order_result.status,
+            filled_qty=order_result.filled_qty,
+            filled_price=order_result.filled_avg_price,
+            order_id=order_result.order_id,
+            signal_id=signal_id,
+            reasoning=reason,
+        )
+        self.db.mark_signal_executed(signal_id)
+        management_state["earnings_event_date"] = event_date or None
+        management_state["earnings_action"] = (
+            "hold_core" if trim_action == "earnings_hold_core" else "trim"
+        )
+        self._persist_position_management_state(symbol, management_state)
+        self._notify_order(
+            symbol=symbol,
+            side="sell",
+            qty=float(sell_qty),
+            status=str(order_result.status),
+            order_id=order_result.order_id,
+            filled_price=order_result.filled_avg_price,
+            reasoning=reason,
+            source=trim_action,
+        )
+        return {
+            "symbol": symbol,
+            "action": "SELL",
+            "traded": True,
+            "side": "sell",
+            "qty": float(sell_qty),
+            "order_id": order_result.order_id,
+            "status": order_result.status,
+            "rule_exit": trim_action,
+            "earnings_managed": True,
         }
 
     def _trade_minervini_partial_profit(
@@ -1966,6 +2469,15 @@ class Orchestrator:
             preflight = self._run_minervini_preflight()
         except Exception as e:
             logger.error("Minervini preflight failed during snapshot: %s", e, exc_info=True)
+        if not self.execution_enabled or self.tracker is None:
+            self._notify_morning_scan(preflight, None)
+            return {
+                "alerts_only": True,
+                "trade_date": date.today().isoformat(),
+                "approved_symbols": preflight.approved_symbols if preflight is not None else [],
+                "market_regime": preflight.market_regime if preflight is not None else None,
+            }
+
         snapshot = self.tracker.take_daily_snapshot()
         if self.config.get("minervini_live_exit_enabled", True):
             try:
@@ -1980,6 +2492,16 @@ class Orchestrator:
 
     def run_daily_reflection(self) -> Dict:
         """After market close: reflect on today's trades and update memories."""
+        if not self.execution_enabled or self.tracker is None:
+            logger.info("Alerts-only mode: skipping daily reflection.")
+            return {
+                "alerts_only": True,
+                "reflected": 0,
+                "skipped": 0,
+                "report_path": None,
+                "fallback_used": False,
+            }
+
         logger.info("Running daily reflection...")
 
         positions = self.broker.get_positions()
@@ -2025,6 +2547,28 @@ class Orchestrator:
         self, save: bool = True, report_date: Optional[str] = None
     ) -> Dict:
         """Build a daily account/trade/P&L report and optionally save it."""
+        if not self.execution_enabled or self.tracker is None:
+            report_day = report_date or date.today().isoformat()
+            report = {
+                "date": report_day,
+                "paper_mode": self.config.get("paper_trading", True),
+                "watchlist": self.watchlist,
+                "account": {},
+                "trade_summary": self.db.get_trade_summary(report_day),
+                "performance": {},
+                "position_summary": {
+                    "open_positions": 0,
+                    "total_unrealized_pl": 0.0,
+                },
+                "positions": [],
+                "screening_batch": self.db.get_screening_batch_on_date(report_day),
+                "setups": self.db.get_setup_candidates_on_date(report_day),
+                "trades": self.db.get_trades_on_date(report_day),
+                "alerts_only": True,
+            }
+            report["miss_review"] = self._build_miss_review(report)
+            return report
+
         report = self.tracker.build_daily_report(report_date)
         report["paper_mode"] = self.config.get("paper_trading", True)
         report["watchlist"] = self.watchlist
@@ -2529,6 +3073,8 @@ class Orchestrator:
 
     def emergency_close_all(self) -> List:
         """Close all positions immediately."""
+        if not self.execution_enabled or self.broker is None:
+            raise RuntimeError("Execution is disabled for this profile")
         logger.warning("EMERGENCY: Closing all positions!")
         results = self.broker.close_all_positions()
         for r in results:
@@ -2541,6 +3087,61 @@ class Orchestrator:
 
     def get_status(self) -> Dict:
         """Get current system status."""
+        if not self.execution_enabled or self.broker is None:
+            latest_setups = self.db.get_latest_setup_candidates()
+            latest_batch = self.db.get_latest_screening_batch()
+            watchlist = list(self.watchlist)
+            if not watchlist and latest_setups:
+                watchlist = [row["symbol"] for row in latest_setups if row.get("symbol")]
+            screening = {
+                "screen_date": latest_batch["screen_date"] if latest_batch else None,
+                "market_regime": latest_batch["market_regime"] if latest_batch else None,
+                "confirmed_uptrend": bool(latest_batch["market_confirmed_uptrend"]) if latest_batch else None,
+                "approved_symbols": latest_batch["approved_symbols"] if latest_batch else [],
+                "setup_count": latest_batch["row_count"] if latest_batch else len(latest_setups),
+            }
+            return {
+                "account": {
+                    "equity": 0.0,
+                    "cash": 0.0,
+                    "buying_power": 0.0,
+                    "daily_pl": 0.0,
+                    "daily_pl_pct": "0.00%",
+                },
+                "positions": [],
+                "market": {
+                    "is_open": False,
+                    "next_open": "n/a",
+                    "next_close": "n/a",
+                },
+                "performance": {},
+                "today": {
+                    "trade_summary": self.db.get_trade_summary(),
+                    "unrealized_pl": 0.0,
+                },
+                "screening": screening,
+                "overlay": {
+                    "enabled": False,
+                    "symbol": None,
+                    "trigger": None,
+                    "fraction": 0.0,
+                    "market_regime": screening.get("market_regime"),
+                    "market_score": None,
+                    "confirmed_uptrend": screening.get("confirmed_uptrend"),
+                    "overlay_allowed": False,
+                    "position_qty": 0.0,
+                    "position_value": 0.0,
+                },
+                "notifications": {
+                    "enabled": self.notifier.enabled,
+                    "provider": "ntfy" if self.notifier.enabled else None,
+                    "topic": self.notifier.topic if self.notifier.enabled else None,
+                    "server": self.notifier.server if self.notifier.enabled else None,
+                },
+                "watchlist": watchlist,
+                "paper_mode": self.config.get("paper_trading", True),
+            }
+
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         clock = self.broker.get_clock()
@@ -2654,6 +3255,89 @@ class Orchestrator:
             return row
         return None
 
+    def _get_position_earnings_context(self, symbol: str) -> Dict[str, Any]:
+        symbol = str(symbol).upper()
+        today = date.today().isoformat()
+        cached = self._latest_earnings_context.get(symbol)
+        if cached is not None and cached.get("computed_on") == today:
+            return cached
+
+        context: Dict[str, Any] = {
+            "symbol": symbol,
+            "next_earnings_datetime": None,
+            "earnings_days_away": None,
+            "earnings_event_date": None,
+            "source": None,
+            "computed_on": today,
+        }
+
+        def _apply(next_earnings_datetime: Any, earnings_days_away: Any, source: str) -> bool:
+            if next_earnings_datetime in (None, "", "NaT"):
+                return False
+            try:
+                earnings_ts = pd.to_datetime(next_earnings_datetime)
+            except Exception:
+                return False
+            if pd.isna(earnings_ts):
+                return False
+            if getattr(earnings_ts, "tzinfo", None) is not None:
+                earnings_ts = earnings_ts.tz_localize(None)
+            days_away = self._to_float(earnings_days_away)
+            if days_away is None:
+                days_away = float(
+                    (earnings_ts.to_pydatetime() - datetime.utcnow()).total_seconds()
+                    / 86400.0
+                )
+            context.update(
+                {
+                    "next_earnings_datetime": earnings_ts.isoformat(),
+                    "earnings_days_away": days_away,
+                    "earnings_event_date": earnings_ts.date().isoformat(),
+                    "source": source,
+                }
+            )
+            return True
+
+        setup = self._get_latest_setup_for_symbol(symbol)
+        if setup and _apply(
+            setup.get("next_earnings_datetime"),
+            setup.get("earnings_days_away"),
+            "setup",
+        ):
+            self._latest_earnings_context[symbol] = context
+            return context
+
+        db_path = self.config.get("minervini_db_path", "research_data/market_data.duckdb")
+        try:
+            warehouse = MarketDataWarehouse(db_path, read_only=True)
+            try:
+                fundamentals = warehouse.get_latest_fundamentals([symbol])
+            finally:
+                warehouse.close()
+            if not fundamentals.empty:
+                row = fundamentals.iloc[0].to_dict()
+                _apply(
+                    row.get("next_earnings_datetime"),
+                    None,
+                    "warehouse",
+                )
+        except Exception as exc:
+            logger.debug("Could not load earnings context for %s: %s", symbol, exc)
+
+        self._latest_earnings_context[symbol] = context
+        return context
+
+    def _earnings_window_active(self, context: Optional[Dict[str, Any]]) -> bool:
+        if not self.config.get("minervini_earnings_management_enabled", True):
+            return False
+        if not context:
+            return False
+        days_away = self._to_float(context.get("earnings_days_away"))
+        if days_away is None:
+            return False
+        exit_days = max(int(self.config.get("minervini_earnings_exit_days", 5)), 0)
+        return 0.0 <= days_away <= float(exit_days)
+
     def _load_position_management_state(
         self, symbol: str, state: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -2675,6 +3359,8 @@ class Orchestrator:
             or bool(inferred.get("add_on_1_done", False)),
             "add_on_2_done": bool(row.get("add_on_2_done", False))
             or bool(inferred.get("add_on_2_done", False)),
+            "earnings_event_date": row.get("earnings_event_date"),
+            "earnings_action": row.get("earnings_action"),
         }
 
     def _persist_position_management_state(
@@ -2686,6 +3372,8 @@ class Orchestrator:
             partial_profit_taken=bool(state.get("partial_profit_taken")),
             add_on_1_done=bool(state.get("add_on_1_done")),
             add_on_2_done=bool(state.get("add_on_2_done")),
+            earnings_event_date=state.get("earnings_event_date"),
+            earnings_action=state.get("earnings_action"),
         )
 
     def _setup_supports_pyramiding(

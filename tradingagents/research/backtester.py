@@ -30,6 +30,10 @@ class BacktestConfig:
     add_on_fraction_1: float = 0.30
     add_on_fraction_2: float = 0.20
     breakeven_trigger_pct: float = 0.05
+    trailing_lock_trigger_pct_1: float = 0.12
+    trailing_lock_floor_pct_1: float = 0.03
+    trailing_lock_trigger_pct_2: float = 0.20
+    trailing_lock_floor_pct_2: float = 0.08
     partial_profit_trigger_pct: float = 0.12
     partial_profit_fraction: float = 0.33
     use_ema21_exit: bool = False
@@ -48,6 +52,9 @@ class BacktestConfig:
     min_roc_20: float = -1.0
     min_roc_60: float = -1.0
     min_roc_120: float = -1.0
+    market_extension_filter_enabled: bool = False
+    market_extension_max_qqq_above_ema21_pct: float = 0.05
+    market_extension_max_qqq_roc_5: float = 0.05
 
 
 class MinerviniBacktester:
@@ -74,6 +81,10 @@ class MinerviniBacktester:
             columns = ["market_confirmed_uptrend", "market_regime"]
             if "market_score" in market_context_df.columns:
                 columns.append("market_score")
+            if "qqq_extension_pct" in market_context_df.columns:
+                columns.append("qqq_extension_pct")
+            if "qqq_roc_5" in market_context_df.columns:
+                columns.append("qqq_roc_5")
             return market_context_df[columns].copy().sort_index()
 
         if benchmark_df is None or benchmark_df.empty:
@@ -737,6 +748,35 @@ class MinerviniBacktester:
             if float(row["close_range_pct"]) < self.config.min_close_range_pct:
                 return False
         return bool(row.get("breakout_ready")) or bool(row.get("breakout_signal"))
+
+    def _market_extended_for_add_on(
+        self,
+        regime_frame: pd.DataFrame,
+        trade_date,
+    ) -> bool:
+        if not self.config.market_extension_filter_enabled:
+            return False
+        if regime_frame.empty or trade_date not in regime_frame.index:
+            return False
+
+        row = regime_frame.loc[trade_date]
+        extension_pct = row.get("qqq_extension_pct")
+        roc_5 = row.get("qqq_roc_5")
+        extension_hot = (
+            pd.notna(extension_pct)
+            and float(extension_pct) >= self.config.market_extension_max_qqq_above_ema21_pct
+        )
+        momentum_hot = (
+            pd.notna(roc_5)
+            and float(roc_5) >= self.config.market_extension_max_qqq_roc_5
+        )
+        if pd.notna(extension_pct) and pd.notna(roc_5):
+            return extension_hot and momentum_hot
+        if pd.notna(extension_pct):
+            return extension_hot
+        if pd.notna(roc_5):
+            return momentum_hot
+        return False
 
     def _regime_position_scale(self, regime_ok: bool) -> float:
         if self.config.scale_exposure_in_weak_market and not regime_ok:

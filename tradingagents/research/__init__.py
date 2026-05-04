@@ -1,5 +1,7 @@
 from .backtester import BacktestConfig, MinerviniBacktester
 from .broad_scanner import BroadMarketConfig, BroadMarketScreener
+from .canslim import CANSLIMConfig, CANSLIMScreener
+from .canslim_backtester import PortfolioCANSLIMBacktester
 from .market_context import build_market_context
 from .minervini import MinerviniConfig, MinerviniScreener
 from .portfolio_backtester import PortfolioBacktestResult, PortfolioMinerviniBacktester
@@ -13,6 +15,9 @@ from .warehouse import MarketDataWarehouse
 
 __all__ = [
     "MarketDataWarehouse",
+    "CANSLIMConfig",
+    "CANSLIMScreener",
+    "PortfolioCANSLIMBacktester",
     "MinerviniConfig",
     "MinerviniScreener",
     "BroadMarketConfig",

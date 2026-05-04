@@ -21,6 +21,8 @@ from stockstats import wrap
 from tradingagents.research import (
     BroadMarketConfig,
     BroadMarketScreener,
+    CANSLIMConfig,
+    CANSLIMScreener,
     MarketDataWarehouse,
     MinerviniConfig,
     MinerviniScreener,
@@ -320,6 +322,38 @@ class MinerviniPreScreener:
             }
             benchmark_df = warehouse.get_daily_bars(benchmark, start_date, end_date)
             fundamentals_df = warehouse.get_latest_fundamentals(symbols)
+            quarterly_df = warehouse.get_quarterly_fundamentals(symbols)
+
+            selection_strategy = str(
+                self.config.get("selection_strategy", "minervini")
+            ).strip().lower()
+            canslim_df = pd.DataFrame()
+            if selection_strategy == "canslim_minervini":
+                selected_symbols, canslim_df = self._apply_canslim_selection(
+                    data_by_symbol=data_by_symbol,
+                    quarterly_df=quarterly_df,
+                    fundamentals_df=fundamentals_df,
+                )
+                if not selected_symbols:
+                    if not canslim_df.empty:
+                        canslim_df = canslim_df.copy()
+                        canslim_df["selected_for_analysis"] = False
+                    return MinerviniPreflight(
+                        trade_date=end_date,
+                        market_regime="screened_out",
+                        confirmed_uptrend=False,
+                        approved_symbols=[],
+                        blocked_symbols=list(data_by_symbol.keys()),
+                        screened_symbols=list(data_by_symbol.keys()),
+                        screen_df=canslim_df,
+                        coarse_candidates_path=coarse_candidates_path,
+                    )
+                data_by_symbol = {
+                    symbol: frame
+                    for symbol, frame in data_by_symbol.items()
+                    if symbol in selected_symbols
+                }
+                symbols = list(data_by_symbol.keys())
 
             screener = MinerviniScreener(
                 MinerviniConfig(
@@ -371,6 +405,24 @@ class MinerviniPreScreener:
                 benchmark_df=benchmark_df,
                 fundamentals_df=fundamentals_df,
             )
+            if selection_strategy == "canslim_minervini" and not screen_df.empty and not canslim_df.empty:
+                canslim_merge = canslim_df[
+                    [
+                        "symbol",
+                        "canslim_score",
+                        "canslim_selected",
+                        "canslim_current_ok",
+                        "canslim_annual_ok",
+                        "canslim_fundamental_ok",
+                        "new_high_signal",
+                        "canslim_volume_signal",
+                        "canslim_leader_signal",
+                    ]
+                ].drop_duplicates(subset="symbol")
+                screen_df = screen_df.merge(canslim_merge, on="symbol", how="left")
+                screen_df["selection_strategy"] = "canslim_minervini"
+            elif not screen_df.empty:
+                screen_df["selection_strategy"] = selection_strategy
 
             if not screen_df.empty:
                 approved_mask = (
@@ -414,6 +466,119 @@ class MinerviniPreScreener:
             )
         finally:
             warehouse.close()
+
+    def _apply_canslim_selection(
+        self,
+        data_by_symbol: dict[str, pd.DataFrame],
+        quarterly_df: pd.DataFrame,
+        fundamentals_df: pd.DataFrame,
+    ) -> tuple[list[str], pd.DataFrame]:
+        quarterly_by_symbol = (
+            {
+                symbol: frame.copy()
+                for symbol, frame in quarterly_df.groupby("symbol")
+            }
+            if quarterly_df is not None and not quarterly_df.empty
+            else {}
+        )
+        fundamentals_lookup = (
+            fundamentals_df.set_index("symbol").to_dict("index")
+            if fundamentals_df is not None and not fundamentals_df.empty
+            else {}
+        )
+
+        screener = CANSLIMScreener(
+            CANSLIMConfig(
+                near_52w_high_pct=float(self.config.get("canslim_near_52w_high_pct", 0.15)),
+                volume_surge_multiple=float(
+                    self.config.get("canslim_volume_surge_multiple", 1.2)
+                ),
+                min_close_range_pct=float(
+                    self.config.get("canslim_min_close_range_pct", 0.50)
+                ),
+                min_current_eps_growth=float(
+                    self.config.get("canslim_min_current_eps_growth", 0.25)
+                ),
+                min_current_revenue_growth=float(
+                    self.config.get("canslim_min_current_revenue_growth", 0.20)
+                ),
+                min_annual_eps_growth=float(
+                    self.config.get("canslim_min_annual_eps_growth", 0.20)
+                ),
+                min_annual_revenue_growth=float(
+                    self.config.get("canslim_min_annual_revenue_growth", 0.15)
+                ),
+                require_fundamentals=bool(
+                    self.config.get("canslim_require_fundamentals", True)
+                ),
+            )
+        )
+
+        rows: list[dict] = []
+        selected_symbols: list[str] = []
+        min_score = float(self.config.get("canslim_min_score", 4.0))
+        require_new_high = bool(self.config.get("canslim_require_new_high_signal", True))
+        require_volume = bool(self.config.get("canslim_require_volume_signal", False))
+        require_leader = bool(self.config.get("canslim_require_leader_signal", True))
+
+        for symbol, df in data_by_symbol.items():
+            prepared = screener.prepare_features(
+                df,
+                quarterly_df=quarterly_by_symbol.get(symbol),
+            )
+            if prepared.empty:
+                continue
+            row = prepared.iloc[-1].copy()
+            latest = row.to_dict()
+            latest["symbol"] = symbol
+            latest["sector"] = fundamentals_lookup.get(symbol, {}).get("sector")
+            latest["industry"] = fundamentals_lookup.get(symbol, {}).get("industry")
+
+            selected = bool(latest.get("canslim_score", 0) >= min_score)
+            selected = selected and bool(latest.get("near_52w_high", False))
+            if require_new_high:
+                selected = selected and bool(latest.get("new_high_signal", False))
+            if require_volume:
+                selected = selected and bool(latest.get("canslim_volume_signal", False))
+            if require_leader:
+                selected = selected and bool(latest.get("canslim_leader_signal", False))
+            if bool(self.config.get("canslim_require_fundamentals", True)):
+                annual_available = (
+                    pd.notna(latest.get("annual_eps_growth"))
+                    or pd.notna(latest.get("annual_revenue_growth"))
+                )
+                annual_gate = bool(latest.get("canslim_annual_ok", False)) or not annual_available
+                selected = (
+                    selected
+                    and bool(latest.get("canslim_current_ok", False))
+                    and bool(latest.get("canslim_positive_eps_ok", False))
+                    and annual_gate
+                )
+
+            latest["canslim_selected"] = selected
+            latest["selected_for_analysis"] = selected
+            latest["selection_strategy"] = "canslim_minervini"
+            rows.append(latest)
+            if selected:
+                selected_symbols.append(symbol)
+
+        screen_df = pd.DataFrame(rows)
+        if not screen_df.empty:
+            sort_cols = [col for col in ["canslim_score", "rs_percentile"] if col in screen_df.columns]
+            ascending = [False] * len(sort_cols)
+            if sort_cols:
+                screen_df = screen_df.sort_values(
+                    by=sort_cols,
+                    ascending=ascending,
+                    na_position="last",
+                ).reset_index(drop=True)
+
+        logger.info(
+            "CAN SLIM prefilter kept %s/%s symbols",
+            len(selected_symbols),
+            len(data_by_symbol),
+        )
+        return selected_symbols, screen_df
 
     def _load_cached_preflight(self, symbols: list[str]) -> MinerviniPreflight:
         db = TradingDatabase(self.config.get("db_path", "trading.db"))

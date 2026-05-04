@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -28,7 +29,38 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _detect_profile(argv: list[str]) -> str:
+    for idx, arg in enumerate(argv):
+        if arg == "--profile" and idx + 1 < len(argv):
+            return argv[idx + 1].strip().lower()
+        if arg.startswith("--profile="):
+            return arg.split("=", 1)[1].strip().lower()
+    return os.getenv("TRADING_PROFILE", "default").strip().lower()
+
+
+def _load_runtime_env() -> str:
+    repo_root = _repo_root()
+    profile = _detect_profile(sys.argv[1:])
+    load_dotenv(repo_root / ".env")
+    profile_dir = repo_root / "profiles" / profile
+    profile_env = profile_dir / ".env"
+    if profile_env.exists():
+        load_dotenv(profile_env, override=True)
+    os.environ["TRADING_PROFILE"] = profile
+    os.environ.setdefault("TRADING_PROFILE_DIR", str(profile_dir))
+    os.environ.setdefault(
+        "TRADING_RUNTIME_ROOT",
+        str(repo_root / "runtime" / profile),
+    )
+    return profile
+
+
+CURRENT_PROFILE = _load_runtime_env()
 
 from tradingagents.automation.config import build_config
 from tradingagents.automation.launchd import install_launch_agent, uninstall_launch_agent
@@ -40,13 +72,15 @@ from tradingagents.automation.social_monitor import SocialFeedMonitor
 
 def setup_logging(verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
+    log_path = Path(os.getenv("TRADING_LOG_PATH", "trading.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("trading.log", mode="a"),
+            logging.FileHandler(log_path, mode="a"),
         ],
     )
     # Quiet noisy libraries
@@ -56,9 +90,14 @@ def setup_logging(verbose: bool = False):
     logging.getLogger("alpaca").setLevel(logging.WARNING)
 
 
+def _runtime_overrides(args) -> dict:
+    profile = getattr(args, "profile", None) or CURRENT_PROFILE
+    return {"profile_name": profile}
+
+
 def cmd_run(args):
     """Run analysis and trading immediately."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     if args.symbols:
         config["watchlist"] = [s.strip().upper() for s in args.symbols.split(",")]
     if args.model:
@@ -94,7 +133,7 @@ def cmd_run(args):
 
 def cmd_schedule(args):
     """Start the automated scheduler."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     if args.symbols:
         config["watchlist"] = [s.strip().upper() for s in args.symbols.split(",")]
     if args.mode:
@@ -111,6 +150,7 @@ def cmd_schedule(args):
         print(f"  Watchlist: {config['watchlist']}")
     print(f"  Swing time: {config['swing_analysis_time']} ET")
     print(f"  Minervini gate: {config['minervini_enabled']}")
+    print(f"  Selection: {config.get('selection_strategy', 'minervini')}")
     print(f"  Overlay: {config.get('overlay_enabled', False)}")
     print(f"  Press Ctrl+C to stop")
     print()
@@ -121,13 +161,15 @@ def cmd_schedule(args):
 
 def cmd_status(args):
     """Show current status."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     orch = Orchestrator(config)
     status = orch.get_status()
 
     print("\n" + "=" * 50)
     print("TRADING SYSTEM STATUS")
     print("=" * 50)
+    print(f"\n  Profile: {config.get('profile_name', 'default')}")
+    print(f"  Selection: {config.get('selection_strategy', 'minervini')}")
 
     acct = status["account"]
     print(f"\n  Account:")
@@ -205,7 +247,7 @@ def cmd_status(args):
 
 def cmd_close_all(args):
     """Emergency close all positions."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     orch = Orchestrator(config)
 
     if not args.confirm:
@@ -220,7 +262,7 @@ def cmd_close_all(args):
 
 def cmd_trades(args):
     """Show recent trades."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     from tradingagents.storage.database import TradingDatabase
     db = TradingDatabase(config["db_path"])
     trades = db.get_recent_trades(limit=args.limit)
@@ -237,7 +279,7 @@ def cmd_trades(args):
 
 def cmd_report(args):
     """Show and optionally save the current daily report."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     orch = Orchestrator(config)
     report = orch.generate_daily_report(save=not args.no_save)
 
@@ -246,6 +288,7 @@ def cmd_report(args):
     perf = report["performance"]
     position_summary = report["position_summary"]
     screening_batch = report.get("screening_batch")
+    attribution = report.get("attribution", {}) or {}
 
     print("\n" + "=" * 50)
     print("DAILY REPORT")
@@ -286,6 +329,36 @@ def cmd_report(args):
         print(f"    Max drawdown:  {perf.get('max_drawdown_pct', 'N/A')}")
         print(f"    Sharpe ratio:  {perf.get('sharpe_ratio', 'N/A')}")
 
+    benchmark_window = attribution.get("benchmark_window", {}) or {}
+    snapshot_attr = attribution.get("snapshot_attribution", {}) or {}
+    benchmarks = benchmark_window.get("benchmarks", {}) or {}
+    if benchmark_window.get("strategy_return") is not None:
+        print(f"\n  Benchmark Window ({benchmark_window.get('period', 'n/a')}):")
+        print(f"    Start:         {benchmark_window.get('start_date', 'n/a')}")
+        print(f"    End:           {benchmark_window.get('end_date', 'n/a')}")
+        print(f"    Strategy:      {float(benchmark_window.get('strategy_return', 0.0)):.2%}")
+        for symbol in ("SPY", "QQQ", "SMH"):
+            if symbol in benchmarks:
+                print(f"    {symbol}:          {float(benchmarks[symbol]):.2%}")
+        if "alpha_vs_spy" in benchmark_window:
+            print(f"    Alpha vs SPY:  {float(benchmark_window.get('alpha_vs_spy', 0.0)):.2%}")
+        if "alpha_vs_qqq" in benchmark_window:
+            print(f"    Alpha vs QQQ:  {float(benchmark_window.get('alpha_vs_qqq', 0.0)):.2%}")
+
+    if snapshot_attr.get("available"):
+        print(f"\n  Return Attribution:")
+        print(f"    Window:        {snapshot_attr.get('start_date')} -> {snapshot_attr.get('end_date')}")
+        print(f"    Benchmark:     {snapshot_attr.get('benchmark_symbol')}")
+        print(f"    Strategy:      {float(snapshot_attr.get('strategy_return', 0.0)):.2%}")
+        print(f"    Overlay:       ${float(snapshot_attr.get('overlay_pnl', 0.0)):>12,.2f}  ({float(snapshot_attr.get('overlay_return_equiv', 0.0)):.2%})")
+        print(f"    Beta:          ${float(snapshot_attr.get('beta_pnl', 0.0)):>12,.2f}  ({float(snapshot_attr.get('beta_return_equiv', 0.0)):.2%})")
+        print(f"    Selection:     ${float(snapshot_attr.get('selection_pnl', 0.0)):>12,.2f}  ({float(snapshot_attr.get('selection_return_equiv', 0.0)):.2%})")
+        print(f"    Avg overlay:   {float(snapshot_attr.get('avg_overlay_weight', 0.0)):.2%}")
+        print(f"    Avg stock:     {float(snapshot_attr.get('avg_stock_weight', 0.0)):.2%}")
+    elif snapshot_attr:
+        print(f"\n  Return Attribution:")
+        print(f"    Status:        {snapshot_attr.get('reason') or snapshot_attr.get('error') or 'Unavailable'}")
+
     if screening_batch:
         print(f"\n  Screening Batch:")
         print(f"    Screen date:   {screening_batch['screen_date']}")
@@ -324,7 +397,7 @@ def cmd_report(args):
 
 def cmd_setups(args):
     """Show the latest Minervini setup candidates saved by automation."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     from tradingagents.storage.database import TradingDatabase
 
     db = TradingDatabase(config["db_path"])
@@ -370,6 +443,8 @@ def cmd_install_service(args):
     repo_root = Path(__file__).resolve().parent
     project_python = repo_root / ".venv" / "bin" / "python"
     python_bin = project_python if project_python.exists() else Path(sys.executable)
+    config = build_config(_runtime_overrides(args))
+    label = args.label or config.get("service_label", "com.tradingagents.scheduler")
     symbols = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
 
     plist_path = install_launch_agent(
@@ -377,24 +452,35 @@ def cmd_install_service(args):
         python_bin=str(python_bin),
         mode=args.mode,
         symbols=symbols,
-        label=args.label,
+        label=label,
+        log_dir=str(Path(config["results_dir"]) / "service_logs"),
+        environment_variables={
+            "TRADING_PROFILE": config.get("profile_name", "default"),
+            "TRADING_PROFILE_DIR": os.getenv("TRADING_PROFILE_DIR", ""),
+            "TRADING_RUNTIME_ROOT": config.get("runtime_root", ""),
+            "TRADING_SERVICE_LABEL": label,
+        },
     )
 
     print("Launch agent installed.")
-    print(f"  Label: {args.label}")
+    print(f"  Profile: {config.get('profile_name', 'default')}")
+    print(f"  Label: {label}")
     print(f"  Plist: {plist_path}")
     print(f"  Python: {python_bin}")
     print(f"  Mode: {args.mode}")
     print(f"  Symbols: {symbols or 'config watchlist'}")
-    print(f"  Logs: {repo_root / 'results' / 'service_logs'}")
+    print(f"  Logs: {Path(config['results_dir']) / 'service_logs'}")
     print()
 
 
 def cmd_remove_service(args):
     """Remove the macOS launch agent."""
-    plist_path = uninstall_launch_agent(label=args.label)
+    config = build_config(_runtime_overrides(args))
+    label = args.label or config.get("service_label", "com.tradingagents.scheduler")
+    plist_path = uninstall_launch_agent(label=label)
     print("Launch agent removed.")
-    print(f"  Label: {args.label}")
+    print(f"  Profile: {config.get('profile_name', 'default')}")
+    print(f"  Label: {label}")
     print(f"  Plist: {plist_path}")
     print()
 
@@ -430,7 +516,7 @@ def cmd_dashboard(args):
 
 def cmd_notify_test(args):
     """Send a test ntfy notification."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     notifier = NtfyNotifier(config)
     if not notifier.enabled:
         print("ntfy is not enabled. Set NTFY_ENABLED=1 and NTFY_TOPIC first.")
@@ -452,7 +538,7 @@ def cmd_notify_test(args):
 
 def cmd_social_check(args):
     """Poll configured X RSS feeds once."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     monitor = SocialFeedMonitor(config)
     result = monitor.check_once()
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -460,7 +546,7 @@ def cmd_social_check(args):
 
 def cmd_social_test(args):
     """Send a test social notification."""
-    config = build_config()
+    config = build_config(_runtime_overrides(args))
     monitor = SocialFeedMonitor(config)
     if not monitor.enabled:
         print("social monitor is not enabled. Set SOCIAL_MONITOR_ENABLED=1 and SOCIAL_NTFY_TOPIC first.")
@@ -480,6 +566,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=CURRENT_PROFILE,
+        help="Runtime profile (for example: paper, live)",
+    )
     sub = parser.add_subparsers(dest="command", help="Command to run")
 
     # run
@@ -530,8 +622,8 @@ def main():
     p_install.add_argument(
         "--label",
         type=str,
-        default="com.tradingagents.scheduler",
-        help="launchd label to install",
+        default=None,
+        help="launchd label to install (defaults to the profile label)",
     )
 
     # remove-service
@@ -542,8 +634,8 @@ def main():
     p_remove.add_argument(
         "--label",
         type=str,
-        default="com.tradingagents.scheduler",
-        help="launchd label to remove",
+        default=None,
+        help="launchd label to remove (defaults to the profile label)",
     )
 
     # dashboard

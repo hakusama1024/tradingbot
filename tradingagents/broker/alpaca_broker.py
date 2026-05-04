@@ -1,7 +1,8 @@
 """Alpaca broker implementation for paper and live trading."""
 
 import logging
-from typing import List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -12,6 +13,7 @@ from alpaca.trading.requests import (
     TrailingStopOrderRequest,
     ClosePositionRequest,
     GetOrdersRequest,
+    GetPortfolioHistoryRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -252,3 +254,32 @@ class AlpacaBroker(BaseBroker):
             mid = (float(q.ask_price) + float(q.bid_price)) / 2
             prices[sym] = mid if mid > 0 else float(q.ask_price or q.bid_price)
         return prices
+
+    def get_portfolio_history(
+        self,
+        period: str = "1M",
+        timeframe: str = "1D",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        extended_hours: bool = False,
+        intraday_reporting: str = "market_hours",
+        pnl_reset: str = "no_reset",
+    ) -> Dict[str, Any]:
+        req = GetPortfolioHistoryRequest(
+            period=period,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            extended_hours=extended_hours,
+            intraday_reporting=intraday_reporting,
+            pnl_reset=pnl_reset,
+        )
+        history = self.trading_client.get_portfolio_history(req)
+        return {
+            "timestamp": list(history.timestamp or []),
+            "equity": list(history.equity or []),
+            "profit_loss": list(history.profit_loss or []),
+            "profit_loss_pct": list(history.profit_loss_pct or []),
+            "base_value": float(history.base_value or 0.0),
+            "timeframe": str(history.timeframe or timeframe),
+        }

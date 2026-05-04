@@ -88,6 +88,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 trade_date=trade_date,
                 positions=positions,
                 prepared_frames=prepared_frames,
+                regime_frame=regime_frame,
                 regime_ok=regime_ok,
                 regime_label=regime_label,
                 trades=trades,
@@ -195,6 +196,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         trade_date,
         positions: dict[str, dict],
         prepared_frames: dict[str, pd.DataFrame],
+        regime_frame: pd.DataFrame,
         regime_ok: bool,
         regime_label: str,
         trades: list[dict],
@@ -220,6 +222,17 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             if price >= average_cost * (1.0 + self.config.breakeven_trigger_pct):
                 position["stop_price"] = max(position["stop_price"], average_cost)
 
+            if price >= average_cost * (1.0 + self.config.trailing_lock_trigger_pct_1):
+                position["stop_price"] = max(
+                    position["stop_price"],
+                    average_cost * (1.0 + self.config.trailing_lock_floor_pct_1),
+                )
+            if price >= average_cost * (1.0 + self.config.trailing_lock_trigger_pct_2):
+                position["stop_price"] = max(
+                    position["stop_price"],
+                    average_cost * (1.0 + self.config.trailing_lock_floor_pct_2),
+                )
+
             if position["partial_taken"] and pd.notna(row.get("ema_21")):
                 position["stop_price"] = max(position["stop_price"], float(row["ema_21"]))
             else:
@@ -229,8 +242,11 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 )
 
             if (
+                not position["partial_taken"]
+                and
                 not position["add_on_1_done"]
                 and regime_label != "market_correction"
+                and not self._market_extended_for_add_on(regime_frame, trade_date)
                 and price >= average_cost * (1.0 + self.config.add_on_trigger_pct_1)
                 and self._row_supports_pyramiding(row, price)
             ):
@@ -257,8 +273,11 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     shares = self._total_shares(position["lots"])
 
             if (
+                not position["partial_taken"]
+                and
                 not position["add_on_2_done"]
                 and regime_label != "market_correction"
+                and not self._market_extended_for_add_on(regime_frame, trade_date)
                 and price >= average_cost * (1.0 + self.config.add_on_trigger_pct_2)
                 and self._row_supports_pyramiding(row, price)
             ):

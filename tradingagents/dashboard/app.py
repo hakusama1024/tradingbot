@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -11,21 +12,31 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_runtime_env():
+    repo_root = _repo_root()
+    profile = os.getenv("TRADING_PROFILE", "default").strip().lower()
+    load_dotenv(repo_root / ".env")
+    profile_env = repo_root / "profiles" / profile / ".env"
+    if profile_env.exists():
+        load_dotenv(profile_env, override=True)
+    os.environ["TRADING_PROFILE"] = profile
+    os.environ.setdefault("TRADING_PROFILE_DIR", str(repo_root / "profiles" / profile))
+    os.environ.setdefault("TRADING_RUNTIME_ROOT", str(repo_root / "runtime" / profile))
+
+
+_load_runtime_env()
 
 from tradingagents.automation.config import build_config
 from tradingagents.automation.orchestrator import Orchestrator
 from tradingagents.storage.database import TradingDatabase
 
-SERVICE_LABEL = "com.tradingagents.scheduler"
 
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _log_paths(repo_root: Path) -> tuple[Path, Path]:
-    log_dir = repo_root / "results" / "service_logs"
+def _log_paths(results_dir: Path) -> tuple[Path, Path]:
+    log_dir = results_dir / "service_logs"
     return (
         log_dir / "automation_service.out.log",
         log_dir / "automation_service.err.log",
@@ -130,7 +141,8 @@ def _setups_frame(db: TradingDatabase) -> pd.DataFrame:
 
 
 def _latest_report(repo_root: Path) -> tuple[dict | None, Path | None]:
-    report_dir = repo_root / "results" / "daily_reports"
+    config = build_config()
+    report_dir = Path(config.get("results_dir", repo_root / "results")) / "daily_reports"
     reports = sorted(report_dir.glob("*.json"))
     if not reports:
         return None, None
@@ -150,9 +162,10 @@ def main():
 
     config, db, orchestrator = _load_runtime()
     repo_root = _repo_root()
-    stdout_log, stderr_log = _log_paths(repo_root)
+    results_dir = Path(config.get("results_dir", repo_root / "results"))
+    stdout_log, stderr_log = _log_paths(results_dir)
     status = orchestrator.get_status()
-    service = _launchctl_status(SERVICE_LABEL)
+    service = _launchctl_status(config.get("service_label", "com.tradingagents.scheduler"))
     snapshots = _snapshots_frame(db)
     recent_trades = _recent_trades_frame(db)
     latest_setups = _setups_frame(db)
@@ -161,6 +174,7 @@ def main():
     with st.sidebar:
         st.subheader("System")
         st.write(f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`")
+        st.write(f"Profile: `{config.get('profile_name', 'default')}`")
         st.write(f"Universe: `{config.get('trading_universe', 'n/a')}`")
         st.write(f"Paper mode: `{config.get('paper_trading', True)}`")
         st.write(f"Service: `{service.get('state', 'unknown')}`")

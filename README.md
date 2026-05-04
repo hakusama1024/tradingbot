@@ -112,22 +112,10 @@ conda create -n tradingagents python=3.13
 conda activate tradingagents
 ```
 
-Or with the standard library `venv`:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
 Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
-This repo can be used in two different ways:
-
-- `Research mode`: local screening/backtests, no Alpaca account required.
-- `Automation mode`: paper trading with Alpaca, scheduled scans, dashboard, and phone notifications.
 
 ### Required APIs
 
@@ -149,362 +137,41 @@ Alternatively, copy `.env.example` to `.env` and fill in your keys:
 cp .env.example .env
 ```
 
-### `.env` Guide For Collaborators
+### Runtime Profiles
 
-Use `.env.example` as the template.
+If you want to run `paper` and `live` side by side, use profiles instead of swapping one `.env` file back and forth.
 
-- `OPENAI_API_KEY`: needed for most agent-based research and trading flows if you use OpenAI models.
-- `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`: needed only for Alpaca paper/live trading, account status, and automated execution.
-- `ALPHA_VANTAGE_API_KEY`: optional, used by some market-data and research paths.
-- `NTFY_TOPIC`: optional, used for phone push notifications.
-- `SOCIAL_NTFY_TOPIC`: optional, used for social-monitor alerts.
-- `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`: optional alternatives to OpenAI.
+Recommended layout:
 
-Recommended sharing workflow:
+- shared keys in `.env`
+- paper-only keys in `profiles/paper/.env`
+- live-only keys in `profiles/live/.env`
+- isolated runtime state in `runtime/paper/` and `runtime/live/`
+
+Create profile env files from the shipped templates:
 
 ```bash
-cp .env.example .env
+cp profiles/paper/.env.example profiles/paper/.env
+cp profiles/live/.env.example profiles/live/.env
 ```
 
-Then fill in only the keys you actually need.
+Then run commands with `--profile`:
 
-- If you only want research / CLI usage: usually `OPENAI_API_KEY` is enough.
-- If you want automated paper trading: add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`.
-- If you want phone notifications: add `NTFY_TOPIC`.
+```bash
+python run_trading.py --profile paper status
+python run_trading.py --profile live status
+python run_trading.py --profile paper install-service --mode both
+python run_trading.py --profile live install-service --mode both
+```
 
-Do not commit `.env`, and do not share real API keys in the repo.
+This keeps these items separated per profile:
 
-### What Each Key Is For
-
-- `OPENAI_API_KEY`
-  - Needed for most agent-driven trading flows in `run_trading.py`.
-  - Also needed if you enable social-monitor translation.
-- `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`
-  - Needed for account status, positions, orders, and automated paper trading.
-  - If these are missing, trading commands that touch the broker will not work.
-- `ALPHA_VANTAGE_API_KEY`
-  - Optional. Some research/data workflows may use it.
-- `NTFY_TOPIC`
-  - Optional. Enables phone push notifications through `ntfy`.
-- `NTFY_ENABLED`
-  - Set to `1` if you want trading notifications enabled.
-- `SOCIAL_NTFY_TOPIC`
-  - Optional. Separate topic for social-feed alerts.
-- `SOCIAL_MONITOR_ENABLED`
-  - Set to `1` if you want RSS-based social monitoring enabled.
-- `SOCIAL_NTFY_ENABLED`
-  - Set to `1` if you want social alerts pushed through `ntfy`.
-- `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`
-  - Optional alternatives if you want to switch model providers.
-
-### Secrets And Local State
-
-These should stay local and should not be committed:
-
-- `.env`
+- Alpaca account keys
 - `trading.db`
 - `results/`
-- `research_data/`
 - `trading.log`
-
-The repo already ignores those paths. Do not paste real tokens or API keys into issues, PRs, or the README.
-
-### Quick Start By Use Case
-
-#### 1. Research only
-
-If your collaborator only wants to run screens/backtests:
-
-```bash
-cp .env.example .env
-```
-
-Fill in:
-
-- `OPENAI_API_KEY` only if they also want to use the agent workflows
-- otherwise, the Minervini research runner can be used without Alpaca
-
-Then run:
-
-```bash
-python run_minervini_research.py --refresh-data --screen --backtest
-```
-
-#### 2. Paper trading / automation
-
-If they want the automated trading system:
-
-```bash
-cp .env.example .env
-```
-
-Fill in at minimum:
-
-- `OPENAI_API_KEY`
-- `ALPACA_API_KEY`
-- `ALPACA_SECRET_KEY`
-
-Optional:
-
-- `NTFY_ENABLED=1`
-- `NTFY_TOPIC`
-- `SOCIAL_MONITOR_ENABLED=1`
-- `SOCIAL_NTFY_ENABLED=1`
-- `SOCIAL_NTFY_TOPIC`
-
-Then sanity-check the setup:
-
-```bash
-python run_trading.py status
-python run_trading.py setups
-```
-
-#### 3. Phone notifications
-
-To use `ntfy`:
-
-- install the `ntfy` app on the phone
-- subscribe to a topic
-- set `NTFY_ENABLED=1` and `NTFY_TOPIC` in `.env`
-
-Then test it:
-
-```bash
-python run_trading.py notify-test
-```
-
-If using social alerts too:
-
-```bash
-python run_trading.py social-test
-```
-
-For RSS-based social monitoring, also set:
-
-- `SOCIAL_MONITOR_ENABLED=1`
-- `SOCIAL_NTFY_ENABLED=1`
-- `SOCIAL_NTFY_TOPIC=your-topic`
-
-### Repo-Specific Trading Extensions
-
-This repo is not just the upstream `TradingAgents` framework. It also includes:
-
-- `run_trading.py`: automated paper-trading CLI
-- `tradingagents/automation/`: scheduler, notifications, social monitor, launchd integration
-- `tradingagents/research/`: Minervini-style screening, local market-data warehouse, regime logic
-- `tradingagents/dashboard/`: local Streamlit dashboard
-- `run_minervini_research.py`: research/backtest runner
-
-The automated trading layer currently supports:
-
-- Minervini-style screening
-- dynamic broad-market coarse scan
-- leader continuation / add-on setups
-- Alpaca paper trading
-- `ntfy` phone notifications
-- optional RSS-based social monitoring
-
-### Running The Main Commands
-
-#### Manual trading analysis
-
-Runs one analysis cycle immediately. If the broker is connected and rules are satisfied, this may place paper orders.
-
-```bash
-python run_trading.py run
-```
-
-With specific symbols:
-
-```bash
-python run_trading.py run --symbols AAPL,NVDA
-```
-
-#### Live status
-
-Shows account, positions, daily P&L, approved setups, and overlay status.
-
-```bash
-python run_trading.py status
-```
-
-#### Recent trades
-
-```bash
-python run_trading.py trades --limit 20
-```
-
-#### Daily report
-
-Shows today’s trades, open positions, performance, and latest screening batch.
-
-```bash
-python run_trading.py report
-```
-
-#### Latest setups
-
-Shows the latest saved screening candidates from automation.
-
-```bash
-python run_trading.py setups
-```
-
-#### Local dashboard
-
-Starts a local Streamlit dashboard.
-
-```bash
-python run_trading.py dashboard
-```
-
-Then open:
-
-```text
-http://127.0.0.1:8501
-```
-
-#### Background scheduler
-
-Runs the automation loop in the foreground:
-
-```bash
-python run_trading.py schedule --mode both
-```
-
-Current schedule is based on `US/Eastern`:
-
-- `09:25 ET`: market-open snapshot and morning scan
-- `10:00-15:00 ET`: intraday scan every hour
-- `15:30 ET`: swing analysis
-- `16:30 ET`: daily reflection and report
-
-#### macOS background service
-
-On macOS, install the scheduler as a `launchd` service:
-
-```bash
-python run_trading.py install-service --mode both
-```
-
-Remove it:
-
-```bash
-python run_trading.py remove-service
-```
-
-Service logs are written under:
-
-```text
-results/service_logs/
-```
-
-#### Emergency close
-
-```bash
-python run_trading.py close-all --confirm
-```
-
-Use this carefully. It will attempt to close all open positions.
-
-### Research / Backtest Runner
-
-The research script builds a local DuckDB market-data store, runs Minervini-style screens, and can backtest candidate universes.
-
-Basic run:
-
-```bash
-python run_minervini_research.py --refresh-data --screen --backtest
-```
-
-Example with explicit symbols:
-
-```bash
-python run_minervini_research.py \
-  --symbols NVDA,MSFT,ANET \
-  --refresh-data \
-  --refresh-fundamentals \
-  --screen \
-  --backtest
-```
-
-Useful options:
-
-- `--period 1y|2y|3y|5y`
-- `--start YYYY-MM-DD --end YYYY-MM-DD`
-- `--trade-start YYYY-MM-DD`
-- `--screen-count N`
-- `--min-rs`
-- `--require-acceleration`
-- `--allow-missing-fundamentals`
-- `--allow-market-correction`
-
-Artifacts are written to:
-
-- `research_data/market_data.duckdb`
-- `results/minervini/`
-
-### Dashboard And Output Files
-
-Common local artifacts:
-
-- `trading.db`: local SQLite database for signals, trades, snapshots, and setups
-- `results/daily_reports/`: JSON daily summaries
-- `results/service_logs/`: scheduler stdout/stderr logs
-- `results/minervini/`: research outputs and CSV exports
-- `research_data/market_data.duckdb`: local market-data warehouse
-
-These files are local runtime state, not source code.
-
-### Recommended First Run For A Collaborator
-
-If someone is new to the repo, this is the cleanest sequence:
-
-```bash
-git clone git@github.com:hakusama1024/tradingbot.git
-cd tradingbot
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-Then:
-
-1. Fill in the required keys in `.env`.
-2. Validate the install:
-
-```bash
-python run_trading.py status
-python run_trading.py notify-test
-```
-
-3. If they only want research:
-
-```bash
-python run_minervini_research.py --refresh-data --screen
-```
-
-4. If they want the dashboard:
-
-```bash
-python run_trading.py dashboard
-```
-
-5. If they want background automation on macOS:
-
-```bash
-python run_trading.py install-service --mode both
-```
-
-### Notes For Collaborators
-
-- The trading system is configured for Alpaca paper trading by default.
-- Automation may place paper orders when rules are satisfied.
-- `run_trading.py run` is not a dry run.
-- `run_trading.py status` and `dashboard` both talk to the broker and local DB.
-- Social monitoring uses RSS by default in this repo, not the paid X API.
-- Some research/data downloads may take a while on first run because the local market-data warehouse is being built.
+- `launchd` service label
+- phone notifications if you use different topics
 
 ### CLI Usage
 

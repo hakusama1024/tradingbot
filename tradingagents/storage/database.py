@@ -119,6 +119,17 @@ class TradingDatabase:
                 created_at    TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS position_management_state (
+                symbol        TEXT PRIMARY KEY,
+                cycle_entry_date TEXT,
+                partial_profit_taken INTEGER DEFAULT 0,
+                add_on_1_done INTEGER DEFAULT 0,
+                add_on_2_done INTEGER DEFAULT 0,
+                earnings_event_date TEXT,
+                earnings_action TEXT,
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
@@ -126,6 +137,8 @@ class TradingDatabase:
             CREATE INDEX IF NOT EXISTS idx_agent_memories_name ON agent_memories(memory_name);
             CREATE INDEX IF NOT EXISTS idx_setup_candidates_date ON setup_candidates(screen_date);
             CREATE INDEX IF NOT EXISTS idx_setup_candidates_symbol ON setup_candidates(symbol);
+            CREATE INDEX IF NOT EXISTS idx_position_management_state_symbol
+                ON position_management_state(symbol);
         """)
         self._ensure_columns(
             "setup_candidates",
@@ -140,6 +153,13 @@ class TradingDatabase:
                 "buy_zone_pct": "REAL",
                 "rule_watch_candidate": "INTEGER DEFAULT 0",
                 "rule_entry_candidate": "INTEGER DEFAULT 0",
+            },
+        )
+        self._ensure_columns(
+            "position_management_state",
+            {
+                "earnings_event_date": "TEXT",
+                "earnings_action": "TEXT",
             },
         )
         self.conn.commit()
@@ -264,6 +284,60 @@ class TradingDatabase:
             "SELECT equity FROM daily_snapshots ORDER BY date ASC LIMIT 1"
         ).fetchone()
         return row["equity"] if row else None
+
+    # ── Position Management State ───────────────────────────────────
+
+    def get_position_management_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM position_management_state WHERE symbol = ? LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_position_management_state(
+        self,
+        symbol: str,
+        cycle_entry_date: Optional[str],
+        partial_profit_taken: bool,
+        add_on_1_done: bool,
+        add_on_2_done: bool,
+        earnings_event_date: Optional[str] = None,
+        earnings_action: Optional[str] = None,
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO position_management_state (
+                symbol, cycle_entry_date, partial_profit_taken,
+                add_on_1_done, add_on_2_done, earnings_event_date,
+                earnings_action, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(symbol) DO UPDATE SET
+                cycle_entry_date = excluded.cycle_entry_date,
+                partial_profit_taken = excluded.partial_profit_taken,
+                add_on_1_done = excluded.add_on_1_done,
+                add_on_2_done = excluded.add_on_2_done,
+                earnings_event_date = excluded.earnings_event_date,
+                earnings_action = excluded.earnings_action,
+                updated_at = datetime('now')
+            """,
+            (
+                symbol,
+                cycle_entry_date,
+                1 if partial_profit_taken else 0,
+                1 if add_on_1_done else 0,
+                1 if add_on_2_done else 0,
+                earnings_event_date,
+                earnings_action,
+            ),
+        )
+        self.conn.commit()
+
+    def delete_position_management_state(self, symbol: str):
+        self.conn.execute(
+            "DELETE FROM position_management_state WHERE symbol = ?",
+            (symbol,),
+        )
+        self.conn.commit()
 
     # ── Agent Memories ───────────────────────────────────────────────
 

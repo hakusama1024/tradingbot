@@ -1,7 +1,8 @@
 """Abstract base class for broker integrations."""
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from .models import OrderRequest, OrderResult, Position, Account, MarketClock
 
@@ -55,4 +56,17 @@ class BaseBroker(ABC):
 
     @abstractmethod
     def get_latest_prices(self, symbols: List[str]) -> dict:
+        ...
+
+    @abstractmethod
+    def get_portfolio_history(
+        self,
+        period: str = "1M",
+        timeframe: str = "1D",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        extended_hours: bool = False,
+        intraday_reporting: str = "market_hours",
+        pnl_reset: str = "no_reset",
+    ) -> Dict[str, Any]:
         ...

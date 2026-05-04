@@ -16,6 +16,22 @@ def build_config(overrides: dict = None) -> dict:
     """Build a complete config merging defaults + automation + overrides."""
     config = DEFAULT_CONFIG.copy()
     overrides = overrides or {}
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    profile_name = (
+        overrides.get("profile_name")
+        or os.getenv("TRADING_PROFILE")
+        or "default"
+    ).strip().lower()
+    runtime_root = os.getenv(
+        "TRADING_RUNTIME_ROOT",
+        os.path.join(repo_root, "runtime", profile_name),
+    )
+    service_label = os.getenv(
+        "TRADING_SERVICE_LABEL",
+        "com.tradingagents.scheduler"
+        if profile_name == "default"
+        else f"com.tradingagents.scheduler.{profile_name}",
+    )
     trading_universe = overrides.get("trading_universe", os.getenv("TRADING_UNIVERSE", "growth"))
     try:
         default_watchlist = [] if is_dynamic_universe(trading_universe) else resolve_universe(trading_universe)
@@ -27,7 +43,8 @@ def build_config(overrides: dict = None) -> dict:
         # Alpaca
         "alpaca_api_key": os.getenv("ALPACA_API_KEY", ""),
         "alpaca_secret_key": os.getenv("ALPACA_SECRET_KEY", ""),
-        "paper_trading": True,
+        "paper_trading": _env_flag("PAPER_TRADING", True),
+        "execution_enabled": _env_flag("EXECUTION_ENABLED", True),
 
         # Trading mode
         "trading_mode": "swing",  # "swing" | "day" | "both"
@@ -78,13 +95,56 @@ def build_config(overrides: dict = None) -> dict:
         "daily_summary_time": os.getenv("DAILY_SUMMARY_TIME", "16:40"),
         "weekly_summary_time": os.getenv("WEEKLY_SUMMARY_TIME", "16:45"),
 
+        # Selection strategy
+        "selection_strategy": os.getenv(
+            "SELECTION_STRATEGY",
+            "minervini",
+        ).strip().lower(),
+        "canslim_min_score": float(os.getenv("CANSLIM_MIN_SCORE", "4.0")),
+        "canslim_require_new_high_signal": _env_flag(
+            "CANSLIM_REQUIRE_NEW_HIGH_SIGNAL",
+            True,
+        ),
+        "canslim_require_volume_signal": _env_flag(
+            "CANSLIM_REQUIRE_VOLUME_SIGNAL",
+            False,
+        ),
+        "canslim_require_leader_signal": _env_flag(
+            "CANSLIM_REQUIRE_LEADER_SIGNAL",
+            True,
+        ),
+        "canslim_require_fundamentals": _env_flag(
+            "CANSLIM_REQUIRE_FUNDAMENTALS",
+            True,
+        ),
+        "canslim_min_current_eps_growth": float(
+            os.getenv("CANSLIM_MIN_CURRENT_EPS_GROWTH", "0.25")
+        ),
+        "canslim_min_current_revenue_growth": float(
+            os.getenv("CANSLIM_MIN_CURRENT_REVENUE_GROWTH", "0.20")
+        ),
+        "canslim_min_annual_eps_growth": float(
+            os.getenv("CANSLIM_MIN_ANNUAL_EPS_GROWTH", "0.20")
+        ),
+        "canslim_min_annual_revenue_growth": float(
+            os.getenv("CANSLIM_MIN_ANNUAL_REVENUE_GROWTH", "0.15")
+        ),
+        "canslim_near_52w_high_pct": float(
+            os.getenv("CANSLIM_NEAR_52W_HIGH_PCT", "0.15")
+        ),
+        "canslim_volume_surge_multiple": float(
+            os.getenv("CANSLIM_VOLUME_SURGE_MULTIPLE", "1.2")
+        ),
+        "canslim_min_close_range_pct": float(
+            os.getenv("CANSLIM_MIN_CLOSE_RANGE_PCT", "0.50")
+        ),
+
         # Minervini swing-trading gate
         "minervini_enabled": True,
         "minervini_benchmark": "SPY",
-        "minervini_db_path": os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "research_data",
-            "market_data.duckdb",
+        "minervini_db_path": os.getenv(
+            "MINERVINI_DB_PATH",
+            os.path.join(repo_root, "research_data", "market_data.duckdb"),
         ),
         "minervini_lookback_days": 730,
         "minervini_min_rs_percentile": 70.0,
@@ -158,6 +218,25 @@ def build_config(overrides: dict = None) -> dict:
         "minervini_add_on_fraction_2": float(
             os.getenv("MINERVINI_ADD_ON_FRACTION_2", "0.20")
         ),
+        "minervini_earnings_management_enabled": _env_flag(
+            "MINERVINI_EARNINGS_MANAGEMENT_ENABLED",
+            True,
+        ),
+        "minervini_earnings_exit_days": int(
+            os.getenv("MINERVINI_EARNINGS_EXIT_DAYS", "5")
+        ),
+        "minervini_earnings_flat_below_gain_pct": float(
+            os.getenv("MINERVINI_EARNINGS_FLAT_BELOW_GAIN_PCT", "0.05")
+        ),
+        "minervini_earnings_trim_below_gain_pct": float(
+            os.getenv("MINERVINI_EARNINGS_TRIM_BELOW_GAIN_PCT", "0.10")
+        ),
+        "minervini_earnings_trim_fraction": float(
+            os.getenv("MINERVINI_EARNINGS_TRIM_FRACTION", "0.50")
+        ),
+        "minervini_earnings_core_trim_fraction": float(
+            os.getenv("MINERVINI_EARNINGS_CORE_TRIM_FRACTION", "0.33")
+        ),
         "minervini_exit_history_days": int(
             os.getenv("MINERVINI_EXIT_HISTORY_DAYS", "180")
         ),
@@ -222,6 +301,16 @@ def build_config(overrides: dict = None) -> dict:
             for item in os.getenv("OVERLAY_CONTEXT_SYMBOLS", "SPY,QQQ,IWM,SMH,^VIX").split(",")
             if item.strip()
         ],
+        "attribution_benchmark_symbol": os.getenv(
+            "ATTRIBUTION_BENCHMARK_SYMBOL",
+            "QQQ",
+        ).upper(),
+        "attribution_comparison_symbols": [
+            item.strip().upper()
+            for item in os.getenv("ATTRIBUTION_COMPARISON_SYMBOLS", "SPY,QQQ,SMH").split(",")
+            if item.strip()
+        ],
+        "attribution_period": os.getenv("ATTRIBUTION_PERIOD", "1M"),
         "ntfy_enabled": _env_flag("NTFY_ENABLED", False),
         "ntfy_server": os.getenv("NTFY_SERVER", "https://ntfy.sh"),
         "ntfy_topic": os.getenv("NTFY_TOPIC", ""),
@@ -236,6 +325,13 @@ def build_config(overrides: dict = None) -> dict:
         "ntfy_daily_summary_enabled": _env_flag("NTFY_DAILY_SUMMARY_ENABLED", True),
         "ntfy_weekly_summary_enabled": _env_flag("NTFY_WEEKLY_SUMMARY_ENABLED", True),
         "ntfy_morning_scan_top_n": int(os.getenv("NTFY_MORNING_SCAN_TOP_N", "5")),
+        "ntfy_morning_scan_rotation_enabled": _env_flag(
+            "NTFY_MORNING_SCAN_ROTATION_ENABLED",
+            True,
+        ),
+        "ntfy_morning_scan_rotation_top_groups": int(
+            os.getenv("NTFY_MORNING_SCAN_ROTATION_TOP_GROUPS", "3")
+        ),
         "ntfy_miss_review_enabled": _env_flag("NTFY_MISS_REVIEW_ENABLED", True),
         "ntfy_miss_review_top_n": int(os.getenv("NTFY_MISS_REVIEW_TOP_N", "5")),
         "ntfy_miss_review_near_buy_threshold_pct": float(
@@ -281,10 +377,12 @@ def build_config(overrides: dict = None) -> dict:
         "default_take_profit_pct": 0.15,
 
         # Storage
-        "db_path": os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "trading.db"
-        ),
+        "profile_name": profile_name,
+        "runtime_root": runtime_root,
+        "results_dir": os.getenv("RESULTS_DIR", os.path.join(runtime_root, "results")),
+        "db_path": os.getenv("TRADING_DB_PATH", os.path.join(runtime_root, "trading.db")),
+        "log_path": os.getenv("TRADING_LOG_PATH", os.path.join(runtime_root, "trading.log")),
+        "service_label": service_label,
 
         # LLM (use cheaper model for automation to control costs)
         "llm_provider": "openai",

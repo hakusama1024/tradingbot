@@ -196,14 +196,16 @@ class TradingScheduler:
         logger.info("TradingAgents Automation Scheduler Starting")
         logger.info(f"Mode: {self.config.get('trading_mode', 'swing')}")
         logger.info(f"Paper: {self.config.get('paper_trading', True)}")
+        logger.info(f"Execution enabled: {self.config.get('execution_enabled', True)}")
         logger.info(f"Watchlist: {self.config.get('watchlist', [])}")
         logger.info("=" * 60)
 
         # Take initial snapshot
-        try:
-            self.orchestrator.tracker.take_daily_snapshot()
-        except Exception as e:
-            logger.warning(f"Could not take initial snapshot: {e}")
+        if self.config.get("execution_enabled", True) and self.orchestrator.tracker is not None:
+            try:
+                self.orchestrator.tracker.take_daily_snapshot()
+            except Exception as e:
+                logger.warning(f"Could not take initial snapshot: {e}")
 
         # Print upcoming jobs
         jobs = self.scheduler.get_jobs()
