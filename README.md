@@ -30,8 +30,9 @@
 ## Local Strategy Stack
 
 This fork includes an automated trading profile stack for paper-trading
-research. Start with [Strategy Overview](docs/STRATEGY_OVERVIEW.md) for the
-current profiles, cadence, and risk boundaries.
+research. Start with [Strategy Overview](docs/STRATEGY_OVERVIEW.md) or
+[中文策略总览](docs/STRATEGY_OVERVIEW_ZH.md) for the current profiles,
+cadence, and risk boundaries.
 
 ## News
 - [2026-03] **TradingAgents v0.2.1** released with GPT-5.4, Gemini 3.1, Claude 4.6 model coverage and improved system stability.
