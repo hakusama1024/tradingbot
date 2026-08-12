@@ -27,6 +27,12 @@
 
 # TradingAgents: Multi-Agents LLM Financial Trading Framework
 
+## Local Strategy Stack
+
+This fork includes an automated trading profile stack for paper-trading
+research. Start with [Strategy Overview](docs/STRATEGY_OVERVIEW.md) for the
+current profiles, cadence, and risk boundaries.
+
 ## News
 - [2026-03] **TradingAgents v0.2.1** released with GPT-5.4, Gemini 3.1, Claude 4.6 model coverage and improved system stability.
 - [2026-02] **TradingAgents v0.2.0** released with multi-provider LLM support (GPT-5.x, Gemini 3.x, Claude 4.x, Grok 4.x) and improved system architecture.
